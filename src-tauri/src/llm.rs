@@ -4,9 +4,10 @@
 //! - 强制 JSON 输出；若首次不是合法 JSON，自动发起一次 JSON 修复重试
 //! - 所有错误都转为可读字符串返回给状态机写日志
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
@@ -14,6 +15,49 @@ use serde_json::{json, Value};
 
 use crate::models::AgentConfig;
 use crate::prompts;
+
+static RATE_LIMIT_PER_MIN: AtomicU64 = AtomicU64::new(0);
+
+fn rate_times() -> &'static Mutex<VecDeque<Instant>> {
+    static TIMES: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+    TIMES.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// 设置每分钟 LLM HTTP 请求上限；0 表示不限。
+pub fn set_rate_limit_per_min(limit: u64) {
+    RATE_LIMIT_PER_MIN.store(limit, Ordering::SeqCst);
+}
+
+/// 简单的进程级滑动窗口限速。等待发生在调度线程内，不会阻塞 UI。
+fn wait_rate_limit() {
+    let limit = RATE_LIMIT_PER_MIN.load(Ordering::SeqCst);
+    if limit == 0 {
+        return;
+    }
+    loop {
+        let wait = {
+            let mut times = match rate_times().lock() {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let now = Instant::now();
+            while let Some(front) = times.front() {
+                if now.duration_since(*front) >= Duration::from_secs(60) {
+                    times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if (times.len() as u64) < limit {
+                times.push_back(now);
+                return;
+            }
+            let front = *times.front().unwrap();
+            Duration::from_secs(60).saturating_sub(now.duration_since(front))
+        };
+        std::thread::sleep(wait.max(Duration::from_millis(50)));
+    }
+}
 
 fn is_anthropic(provider: &str) -> bool {
     provider.to_ascii_lowercase().contains("anthropic")
@@ -63,13 +107,15 @@ pub fn chat_json(
         .build()
         .map_err(|e| format!("创建 HTTP client 失败: {e}"))?;
 
-    let first = request_once(&client, agent, system, user)?;
+    wait_rate_limit();
+    let first = request_once(&client, agent, system, user, true)?;
     match extract_json(&first) {
         Ok(v) => Ok(v),
         Err(first_err) => {
             // 按需求强制结构化输出：解析失败不进入业务状态，先做一次 JSON 修复重试。
             let fix_prompt = prompts::json_fix_user(user, &first);
-            let second = request_once(&client, agent, system, &fix_prompt)?;
+            wait_rate_limit();
+            let second = request_once(&client, agent, system, &fix_prompt, true)?;
             extract_json(&second).map_err(|second_err| {
                 format!(
                     "LLM 返回内容无法解析为 JSON（已自动重试一次）。首次错误: {first_err}；重试错误: {second_err}；原始片段: {}",
@@ -80,18 +126,38 @@ pub fn chat_json(
     }
 }
 
+/// 临时问答通道：普通文本回复，不强制 JSON，也不会触发任何任务调度。
+pub fn chat_text(
+    agent: &AgentConfig,
+    system: &str,
+    user: &str,
+    llm_timeout_sec: &str,
+) -> Result<String, String> {
+    if agent.api_key.trim().is_empty() {
+        return Err(format!("Agent「{}」未配置 apiKey", agent.name));
+    }
+    let timeout = Duration::from_secs(timeout_secs(llm_timeout_sec));
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("创建 HTTP client 失败: {e}"))?;
+    wait_rate_limit();
+    request_once(&client, agent, system, user, false)
+}
+
 fn request_once(
     client: &Client,
     agent: &AgentConfig,
     system: &str,
     user: &str,
+    json_mode: bool,
 ) -> Result<String, String> {
     match endpoint(agent) {
         Ok(url) => {
             if is_anthropic(&agent.provider) {
                 anthropic_request(client, agent, &url, system, user)
             } else {
-                openai_request(client, agent, &url, system, user)
+                openai_request(client, agent, &url, system, user, json_mode)
             }
         }
         Err(e) => Err(e),
@@ -104,6 +170,7 @@ fn openai_request(
     url: &str,
     system: &str,
     user: &str,
+    json_mode: bool,
 ) -> Result<String, String> {
     let mut body = json!({
         "model": agent.model_name,
@@ -111,16 +178,22 @@ fn openai_request(
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user }
-        ],
-        "response_format": { "type": "json_object" }
+        ]
     });
+    if json_mode {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("response_format".into(), json!({ "type": "json_object" }));
+        }
+    }
 
     let mut resp = post_json(client, url, &agent.api_key, &body, false)?;
     // 少数 OpenAI 兼容服务不识别 response_format，降级重试一次。
-    if matches!(
-        resp.status(),
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
-    ) {
+    if json_mode
+        && matches!(
+            resp.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        )
+    {
         let bad_status = resp.status();
         let text = resp.text().unwrap_or_default();
         if text.contains("response_format") || text.contains("json_object") {

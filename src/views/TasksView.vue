@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import NewTaskModal from "../components/NewTaskModal.vue";
 import type { TaskSummary } from "../types";
-import { deleteTask, listTasks } from "../api";
+import { deleteTask, listTasks, resumeTask, startTask } from "../api";
 import { errorMessage, showToast } from "../toast";
 
 const emit = defineEmits<{ (e: "open-task", id: number): void }>();
@@ -25,16 +25,53 @@ async function load() {
 }
 
 const statusMeta: Record<string, { label: string; cls: string }> = {
+  pending: { label: "待运行", cls: "badge-blue" },
   planning: { label: "拆解中", cls: "badge-blue" },
   running: { label: "执行中", cls: "badge-yellow" },
   needs_human: { label: "需人工介入", cls: "badge-red" },
-  paused: { label: "已终止（可恢复）", cls: "badge-yellow" },
+  paused: { label: "已暂停", cls: "badge-yellow" },
+  terminated: { label: "已终止", cls: "badge-red" },
   completed: { label: "已完成", cls: "badge-green" },
   failed: { label: "执行失败", cls: "badge-red" }
 };
 
-function statusOf(s: string) {
-  return statusMeta[s] ?? { label: s, cls: "" };
+function statusOf(task: TaskSummary) {
+  if (task.status === "pending") {
+    if (task.pause_reason === "concurrency") return { label: "等待并发名额", cls: "badge-yellow" };
+    if (task.execution_mode === "scheduled" && task.schedule_enabled)
+      return { label: "等待时间窗口", cls: "badge-blue" };
+    return { label: "待运行", cls: "badge-blue" };
+  }
+  if (task.status === "paused" && task.pause_reason === "waiting_window")
+    return { label: "等待时间窗口", cls: "badge-blue" };
+  const meta = statusMeta[task.status] ?? { label: task.status, cls: "" };
+  return meta;
+}
+
+const modeLabel: Record<string, string> = {
+  immediate: "立即执行",
+  later: "稍后执行",
+  scheduled: "定时执行"
+};
+
+function scheduleText(task: TaskSummary) {
+  if (task.execution_mode !== "scheduled") return "";
+  return `每日 ${task.schedule_start}–${task.schedule_end}${task.schedule_enabled ? "" : "（窗口关闭）"}`;
+}
+
+async function runTask(task: TaskSummary) {
+  try {
+    if (task.status === "pending") {
+      const outcome = await startTask(task.id);
+      showToast(outcome.message, outcome.started ? "success" : "error");
+    } else {
+      await resumeTask(task.id);
+      showToast("已请求恢复调度", "success");
+    }
+    await load();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  }
 }
 
 async function remove(task: TaskSummary) {
@@ -91,8 +128,8 @@ onUnmounted(() => unlisten?.());
         <article v-for="task in tasks" :key="task.id" class="task-card">
           <div class="title-row">
             <div class="title grow">{{ task.task_name }}</div>
-            <span class="badge" :class="statusOf(task.status).cls">
-              {{ statusOf(task.status).label }}
+            <span class="badge" :class="statusOf(task).cls">
+              {{ statusOf(task).label }}
             </span>
           </div>
 
@@ -105,6 +142,8 @@ onUnmounted(() => unlisten?.());
               <b>{{ task.global_max_round }}</b>
             </div>
             <div>阶段：<b>{{ task.task_phase === "global_review" ? "全局评审" : task.task_phase === "plan_approval" ? "方案审批" : "模块开发" }}</b></div>
+            <div>执行：<b>{{ modeLabel[task.execution_mode] ?? task.execution_mode }}</b></div>
+            <div v-if="scheduleText(task)">窗口：<b>{{ scheduleText(task) }}</b></div>
             <div>创建：<b>{{ task.create_time }}</b></div>
           </div>
 
@@ -115,6 +154,13 @@ onUnmounted(() => unlisten?.());
           <div class="task-actions">
             <button class="btn btn-sm btn-primary" @click="emit('open-task', task.id)">
               打开详情
+            </button>
+            <button
+              v-if="task.status === 'pending' || task.status === 'paused' || task.status === 'failed'"
+              class="btn btn-sm"
+              @click="runTask(task)"
+            >
+              {{ task.status === "pending" ? "运行" : "恢复" }}
             </button>
             <button class="btn btn-sm btn-danger right" @click="remove(task)">删除任务</button>
           </div>

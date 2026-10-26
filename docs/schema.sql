@@ -1,6 +1,4 @@
--- AgentCrew SQLite 建表 SQL
--- 与 src-tauri/src/db.rs 的 SCHEMA 保持一致
--- 旧数据库会在启动时通过 ALTER TABLE 自动补齐新增列
+-- AgentCrew V2 SQLite 建表 SQL（与 Rust 内 SCHEMA 一致）
 
 CREATE TABLE IF NOT EXISTS agent_config (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,6 +33,13 @@ CREATE TABLE IF NOT EXISTS task_main (
     tech_stack             TEXT NOT NULL DEFAULT '',
     pending_plan_json      TEXT NOT NULL DEFAULT '',
     cancel_requested       INTEGER NOT NULL DEFAULT 0,
+    execution_mode         TEXT NOT NULL DEFAULT 'later',
+    schedule_start         TEXT NOT NULL DEFAULT '01:00',
+    schedule_end           TEXT NOT NULL DEFAULT '06:00',
+    schedule_enabled       INTEGER NOT NULL DEFAULT 1,
+    schedule_override      INTEGER NOT NULL DEFAULT 0,
+    start_requested        INTEGER NOT NULL DEFAULT 0,
+    pause_reason           TEXT NOT NULL DEFAULT '',
     create_time            TEXT NOT NULL
 );
 
@@ -85,7 +90,16 @@ CREATE TABLE IF NOT EXISTS human_message (
     create_time TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chat_message (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    create_time TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_subtask_task ON subtask(task_id, sort_index);
 CREATE INDEX IF NOT EXISTS idx_task_log_task ON task_log(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_event_task ON task_event(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_human_message_task ON human_message(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_chat_message_task ON chat_message(task_id, id);

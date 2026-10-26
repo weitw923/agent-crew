@@ -1,14 +1,42 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::Local;
 use rusqlite::{params, Connection, Row};
 
 use crate::models::{
-    AgentConfig, AgentInput, AppSettings, GlobalReviewRecord, HumanMessage, IterationRecord,
-    NewTaskInput, PendingPlan, Subtask, TaskConfigInput, TaskDetail, TaskEvent, TaskLog, TaskMain,
-    TaskSummary,
+    AgentConfig, AgentInput, AppSettings, ChatMessage, GlobalReviewRecord, HumanMessage,
+    IterationRecord, NewTaskInput, PendingPlan, Subtask, TaskConfigInput, TaskDetail, TaskEvent,
+    TaskLog, TaskMain, TaskSummary,
 };
+
+/// 运行日志是否持久化。关闭后事件仍会实时推送前端，但不写入数据库。
+static LOG_PERSIST: AtomicBool = AtomicBool::new(true);
+static SYNTHETIC_ID: AtomicI64 = AtomicI64::new(-1);
+
+pub fn set_log_persistence(enabled: bool) {
+    LOG_PERSIST.store(enabled, Ordering::SeqCst);
+}
+
+pub fn log_persistence() -> bool {
+    LOG_PERSIST.load(Ordering::SeqCst)
+}
+
+fn synthetic_id() -> i64 {
+    SYNTHETIC_ID.fetch_sub(1, Ordering::SeqCst)
+}
+
+fn valid_clock(raw: &str) -> bool {
+    let mut parts = raw.trim().split(':');
+    let (Some(h), Some(m), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let (Ok(h), Ok(m)) = (h.parse::<u32>(), m.parse::<u32>()) else {
+        return false;
+    };
+    h < 24 && m < 60
+}
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_config (
@@ -44,6 +72,13 @@ CREATE TABLE IF NOT EXISTS task_main (
     tech_stack             TEXT NOT NULL DEFAULT '',
     pending_plan_json      TEXT NOT NULL DEFAULT '',
     cancel_requested       INTEGER NOT NULL DEFAULT 0,
+    execution_mode         TEXT NOT NULL DEFAULT 'later',
+    schedule_start         TEXT NOT NULL DEFAULT '01:00',
+    schedule_end           TEXT NOT NULL DEFAULT '06:00',
+    schedule_enabled       INTEGER NOT NULL DEFAULT 1,
+    schedule_override      INTEGER NOT NULL DEFAULT 0,
+    start_requested        INTEGER NOT NULL DEFAULT 0,
+    pause_reason           TEXT NOT NULL DEFAULT '',
     create_time            TEXT NOT NULL
 );
 
@@ -94,10 +129,19 @@ CREATE TABLE IF NOT EXISTS human_message (
     create_time TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chat_message (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    create_time TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_subtask_task ON subtask(task_id, sort_index);
 CREATE INDEX IF NOT EXISTS idx_task_log_task ON task_log(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_event_task ON task_event(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_human_message_task ON human_message(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_chat_message_task ON chat_message(task_id, id);
 "#;
 
 pub fn now() -> String {
@@ -176,6 +220,43 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         "design_content",
         "design_content TEXT NOT NULL DEFAULT ''",
     )?;
+    for (column, ddl) in [
+        (
+            "execution_mode",
+            "execution_mode TEXT NOT NULL DEFAULT 'immediate'",
+        ),
+        (
+            "schedule_start",
+            "schedule_start TEXT NOT NULL DEFAULT '01:00'",
+        ),
+        ("schedule_end", "schedule_end TEXT NOT NULL DEFAULT '06:00'"),
+        (
+            "schedule_enabled",
+            "schedule_enabled INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "schedule_override",
+            "schedule_override INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "start_requested",
+            "start_requested INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("pause_reason", "pause_reason TEXT NOT NULL DEFAULT ''"),
+    ] {
+        ensure_column(conn, "task_main", column, ddl)?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chat_message (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+            role        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            create_time TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_message_task ON chat_message(task_id, id);",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -187,6 +268,35 @@ fn seed_settings(conn: &Connection) -> Result<(), String> {
         ("dsh_timeout_sec", defaults.dsh_timeout_sec.as_str()),
         ("dsh_bin", defaults.dsh_bin.as_str()),
         ("dsh_profile", defaults.dsh_profile.as_str()),
+        ("storage_root", defaults.storage_root.as_str()),
+        (
+            "log_persistence",
+            if defaults.log_persistence { "1" } else { "0" },
+        ),
+        (
+            "default_execution_mode",
+            defaults.default_execution_mode.as_str(),
+        ),
+        (
+            "default_module_max_round",
+            defaults.default_module_max_round.as_str(),
+        ),
+        (
+            "default_global_max_round",
+            defaults.default_global_max_round.as_str(),
+        ),
+        (
+            "max_concurrent_tasks",
+            defaults.max_concurrent_tasks.as_str(),
+        ),
+        (
+            "scheduled_enabled",
+            if defaults.scheduled_enabled { "1" } else { "0" },
+        ),
+        (
+            "llm_rate_limit_per_min",
+            defaults.llm_rate_limit_per_min.as_str(),
+        ),
     ];
     for (k, v) in pairs {
         conn.execute(
@@ -356,13 +466,27 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskMain> {
         tech_stack: row.get("tech_stack").unwrap_or_default(),
         pending_plan_json: row.get("pending_plan_json").unwrap_or_default(),
         cancel_requested: row.get::<_, i64>("cancel_requested").unwrap_or(0) != 0,
+        execution_mode: row
+            .get::<_, String>("execution_mode")
+            .unwrap_or_else(|_| "later".into()),
+        schedule_start: row
+            .get::<_, String>("schedule_start")
+            .unwrap_or_else(|_| "01:00".into()),
+        schedule_end: row
+            .get::<_, String>("schedule_end")
+            .unwrap_or_else(|_| "06:00".into()),
+        schedule_enabled: row.get::<_, i64>("schedule_enabled").unwrap_or(0) != 0,
+        schedule_override: row.get::<_, i64>("schedule_override").unwrap_or(0) != 0,
+        start_requested: row.get::<_, i64>("start_requested").unwrap_or(0) != 0,
+        pause_reason: row.get("pause_reason").unwrap_or_default(),
     })
 }
 
 const TASK_COLS: &str = "id,task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
     coder_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,work_dir,
     current_global_round,global_review_records,baseline_tree,manual_review_enabled,tech_stack,
-    pending_plan_json,cancel_requested,create_time";
+    pending_plan_json,cancel_requested,execution_mode,schedule_start,schedule_end,schedule_enabled,
+    schedule_override,start_requested,pause_reason,create_time";
 
 pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
     let agents = list_agents(conn)?;
@@ -448,13 +572,29 @@ pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, Strin
     if input.module_max_round < 1 || input.global_max_round < 1 {
         return Err("轮次上限必须大于等于 1".into());
     }
+    let mode = input.execution_mode.trim();
+    if !matches!(mode, "immediate" | "later" | "scheduled") {
+        return Err("执行模式必须是 immediate / later / scheduled".into());
+    }
+    if mode == "scheduled" {
+        if !valid_clock(&input.schedule_start) || !valid_clock(&input.schedule_end) {
+            return Err("定时窗口时间格式必须是 HH:MM".into());
+        }
+        if input.schedule_start.trim() == input.schedule_end.trim() {
+            return Err("定时窗口开始时间和结束时间不能相同".into());
+        }
+    }
     let coders_json = serde_json::to_string(&input.coder_agent_ids)
         .map_err(|e| format!("coder 列表序列化失败: {e}"))?;
+    let schedule_enabled = mode == "scheduled" && input.schedule_enabled;
     conn.execute(
         "INSERT INTO task_main(task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
             coder_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,
-            work_dir,current_global_round,global_review_records,manual_review_enabled,create_time)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,'','module_dev','planning',?8,0,'[]',?9,?10)",
+            work_dir,current_global_round,global_review_records,manual_review_enabled,
+            execution_mode,schedule_start,schedule_end,schedule_enabled,schedule_override,
+            start_requested,pause_reason,create_time)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,'','module_dev','pending',?8,0,'[]',?9,
+            ?10,?11,?12,?13,0,?14,'',?15)",
         params![
             input.task_name.trim(),
             input.top_requirement.trim(),
@@ -465,6 +605,11 @@ pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, Strin
             input.global_max_round,
             input.work_dir.trim(),
             if input.manual_review_enabled { 1 } else { 0 },
+            mode,
+            input.schedule_start.trim(),
+            input.schedule_end.trim(),
+            if schedule_enabled { 1 } else { 0 },
+            if mode == "immediate" { 1 } else { 0 },
             now()
         ],
     )
@@ -479,7 +624,9 @@ pub fn save_task(conn: &Connection, task: &TaskMain) -> Result<(), String> {
     conn.execute(
         "UPDATE task_main SET global_contract=?1, task_phase=?2, status=?3,
             current_global_round=?4, global_review_records=?5, baseline_tree=?6,
-            tech_stack=?7, pending_plan_json=?8 WHERE id=?9",
+            tech_stack=?7, pending_plan_json=?8, execution_mode=?9, schedule_start=?10,
+            schedule_end=?11, schedule_enabled=?12, schedule_override=?13,
+            start_requested=?14, pause_reason=?15 WHERE id=?16",
         params![
             task.global_contract,
             task.task_phase,
@@ -489,6 +636,13 @@ pub fn save_task(conn: &Connection, task: &TaskMain) -> Result<(), String> {
             task.baseline_tree,
             task.tech_stack,
             task.pending_plan_json,
+            task.execution_mode,
+            task.schedule_start,
+            task.schedule_end,
+            if task.schedule_enabled { 1 } else { 0 },
+            if task.schedule_override { 1 } else { 0 },
+            if task.start_requested { 1 } else { 0 },
+            task.pause_reason,
             task.id
         ],
     )
@@ -624,6 +778,15 @@ pub fn add_log(
     message: &str,
 ) -> Result<TaskLog, String> {
     let create_time = now();
+    if !log_persistence() {
+        return Ok(TaskLog {
+            id: synthetic_id(),
+            task_id,
+            level: level.to_string(),
+            message: message.to_string(),
+            create_time,
+        });
+    }
     conn.execute(
         "INSERT INTO task_log(task_id,level,message,create_time) VALUES (?1,?2,?3,?4)",
         params![task_id, level, message, create_time],
@@ -677,6 +840,7 @@ pub fn get_task_detail(conn: &Connection, task_id: i64) -> Result<TaskDetail, St
     } else {
         Some(pending_plan)
     };
+    let chat_messages = list_chat_messages(conn, task_id, 300)?;
     Ok(TaskDetail {
         task,
         subtasks,
@@ -686,6 +850,7 @@ pub fn get_task_detail(conn: &Connection, task_id: i64) -> Result<TaskDetail, St
         execution_events,
         human_messages,
         pending_plan,
+        chat_messages,
     })
 }
 
@@ -710,6 +875,14 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings, String> {
             "dsh_timeout_sec" => settings.dsh_timeout_sec = v,
             "dsh_bin" => settings.dsh_bin = v,
             "dsh_profile" => settings.dsh_profile = v,
+            "storage_root" => settings.storage_root = v,
+            "log_persistence" => settings.log_persistence = v != "0",
+            "default_execution_mode" => settings.default_execution_mode = v,
+            "default_module_max_round" => settings.default_module_max_round = v,
+            "default_global_max_round" => settings.default_global_max_round = v,
+            "max_concurrent_tasks" => settings.max_concurrent_tasks = v,
+            "scheduled_enabled" => settings.scheduled_enabled = v != "0",
+            "llm_rate_limit_per_min" => settings.llm_rate_limit_per_min = v,
             _ => {}
         }
     }
@@ -723,6 +896,35 @@ pub fn save_settings(conn: &Connection, settings: &AppSettings) -> Result<(), St
         ("dsh_timeout_sec", settings.dsh_timeout_sec.as_str()),
         ("dsh_bin", settings.dsh_bin.as_str()),
         ("dsh_profile", settings.dsh_profile.as_str()),
+        ("storage_root", settings.storage_root.as_str()),
+        (
+            "log_persistence",
+            if settings.log_persistence { "1" } else { "0" },
+        ),
+        (
+            "default_execution_mode",
+            settings.default_execution_mode.as_str(),
+        ),
+        (
+            "default_module_max_round",
+            settings.default_module_max_round.as_str(),
+        ),
+        (
+            "default_global_max_round",
+            settings.default_global_max_round.as_str(),
+        ),
+        (
+            "max_concurrent_tasks",
+            settings.max_concurrent_tasks.as_str(),
+        ),
+        (
+            "scheduled_enabled",
+            if settings.scheduled_enabled { "1" } else { "0" },
+        ),
+        (
+            "llm_rate_limit_per_min",
+            settings.llm_rate_limit_per_min.as_str(),
+        ),
     ];
     for (k, v) in pairs {
         conn.execute(
@@ -764,31 +966,53 @@ pub fn _touch_types() {
 pub fn recover_interrupted(conn: &Connection) -> Result<usize, String> {
     let _ = conn.execute("UPDATE task_main SET cancel_requested=0", []);
     let mut stmt = conn
-        .prepare("SELECT id,status FROM task_main WHERE status IN ('running','planning')")
+        .prepare(
+            "SELECT id,status,execution_mode FROM task_main
+             WHERE status IN ('running','planning')",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2).unwrap_or_else(|_| "later".into()),
+            ))
         })
         .map_err(|e| e.to_string())?;
     let mut items = Vec::new();
     for row in rows {
         items.push(row.map_err(|e| e.to_string())?);
     }
-    for (id, status) in &items {
-        conn.execute(
-            "UPDATE task_main SET status='failed' WHERE id=?1",
-            params![id],
-        )
-        .map_err(|e| e.to_string())?;
-        add_log(
-            conn,
-            *id,
-            "warn",
-            &format!(
-                "应用重启：上次运行的调度已中断（原状态 {status}），可在工作台点击「恢复调度」"
-            ),
-        )?;
+    for (id, status, mode) in &items {
+        if mode == "scheduled" {
+            conn.execute(
+                "UPDATE task_main SET status='paused', pause_reason='waiting_window',
+                    schedule_override=0 WHERE id=?1",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+            add_log(
+                conn,
+                *id,
+                "warn",
+                "应用重启：定时任务已暂停，等待下一个时间窗口自动继续",
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE task_main SET status='failed', pause_reason='' WHERE id=?1",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+            add_log(
+                conn,
+                *id,
+                "warn",
+                &format!(
+                    "应用重启：上次运行的调度已中断（原状态 {status}），可在工作台点击「恢复调度」"
+                ),
+            )?;
+        }
     }
     Ok(items.len())
 }
@@ -804,12 +1028,34 @@ pub fn update_task_config(
     if cfg.module_max_round < 1 || cfg.global_max_round < 1 {
         return Err("轮次上限必须大于等于 1".into());
     }
+    if !matches!(
+        cfg.execution_mode.trim(),
+        "immediate" | "later" | "scheduled"
+    ) {
+        return Err("执行模式必须是 immediate / later / scheduled".into());
+    }
+    if !valid_clock(&cfg.schedule_start) || !valid_clock(&cfg.schedule_end) {
+        return Err("定时窗口时间格式必须是 HH:MM".into());
+    }
+    if cfg.schedule_start.trim() == cfg.schedule_end.trim() {
+        return Err("定时窗口开始时间和结束时间不能相同".into());
+    }
     conn.execute(
-        "UPDATE task_main SET module_max_round=?1, global_max_round=?2, manual_review_enabled=?3 WHERE id=?4",
+        "UPDATE task_main SET module_max_round=?1, global_max_round=?2, manual_review_enabled=?3,
+            execution_mode=?4, schedule_start=?5, schedule_end=?6, schedule_enabled=?7,
+            schedule_override=0 WHERE id=?8",
         params![
             cfg.module_max_round,
             cfg.global_max_round,
             if cfg.manual_review_enabled { 1 } else { 0 },
+            cfg.execution_mode.trim(),
+            cfg.schedule_start.trim(),
+            cfg.schedule_end.trim(),
+            if cfg.execution_mode == "scheduled" && cfg.schedule_enabled {
+                1
+            } else {
+                0
+            },
             task_id
         ],
     )
@@ -847,6 +1093,18 @@ fn row_to_event(row: &Row<'_>) -> rusqlite::Result<TaskEvent> {
     })
 }
 
+/// 构造只推送给前端、不落库的实时事件（日志持久化关闭时使用）。
+pub fn live_event(task_id: i64, subtask_id: Option<i64>, kind: &str, content: &str) -> TaskEvent {
+    TaskEvent {
+        id: synthetic_id(),
+        task_id,
+        subtask_id,
+        kind: kind.to_string(),
+        content: content.to_string(),
+        create_time: now(),
+    }
+}
+
 pub fn add_event(
     conn: &Connection,
     task_id: i64,
@@ -855,6 +1113,16 @@ pub fn add_event(
     content: &str,
 ) -> Result<TaskEvent, String> {
     let create_time = now();
+    if !log_persistence() {
+        return Ok(TaskEvent {
+            id: synthetic_id(),
+            task_id,
+            subtask_id,
+            kind: kind.to_string(),
+            content: content.to_string(),
+            create_time,
+        });
+    }
     conn.execute(
         "INSERT INTO task_event(task_id,subtask_id,kind,content,create_time)
          VALUES (?1,?2,?3,?4,?5)",
@@ -882,6 +1150,21 @@ pub fn list_events(conn: &Connection, task_id: i64, limit: i64) -> Result<Vec<Ta
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![task_id, limit], row_to_event)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 全量事件读取（仅用户主动打开「原始事件」时调用）。
+pub fn list_all_events(conn: &Connection, task_id: i64) -> Result<Vec<TaskEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,task_id,subtask_id,kind,content,create_time FROM task_event
+             WHERE task_id=?1 ORDER BY id ASC LIMIT 50000",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id], row_to_event)
         .map_err(|e| e.to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())
@@ -927,6 +1210,85 @@ pub fn list_human_messages(conn: &Connection, task_id: i64) -> Result<Vec<HumanM
         .map_err(|e| e.to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())
+}
+
+pub fn add_chat_message(
+    conn: &Connection,
+    task_id: i64,
+    role: &str,
+    content: &str,
+) -> Result<ChatMessage, String> {
+    let create_time = now();
+    conn.execute(
+        "INSERT INTO chat_message(task_id,role,content,create_time) VALUES (?1,?2,?3,?4)",
+        params![task_id, role, content, create_time],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ChatMessage {
+        id: conn.last_insert_rowid(),
+        task_id,
+        role: role.to_string(),
+        content: content.to_string(),
+        create_time,
+    })
+}
+
+pub fn list_chat_messages(
+    conn: &Connection,
+    task_id: i64,
+    limit: i64,
+) -> Result<Vec<ChatMessage>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,task_id,role,content,create_time FROM (
+                SELECT id,task_id,role,content,create_time FROM chat_message
+                WHERE task_id=?1 ORDER BY id DESC LIMIT ?2
+             ) ORDER BY id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id, limit], |row| {
+            Ok(ChatMessage {
+                id: row.get("id")?,
+                task_id: row.get("task_id")?,
+                role: row.get("role")?,
+                content: row.get("content")?,
+                create_time: row.get("create_time")?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn clear_chat_messages(conn: &Connection, task_id: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM chat_message WHERE task_id=?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 运行中追加/修改顶层需求与验收标准。
+pub fn update_requirements(
+    conn: &Connection,
+    task_id: i64,
+    top_requirement: &str,
+    accept_criteria: &str,
+) -> Result<TaskMain, String> {
+    if top_requirement.trim().is_empty() {
+        return Err("顶层需求不能为空".into());
+    }
+    if accept_criteria.trim().is_empty() {
+        return Err("项目验收标准不能为空".into());
+    }
+    conn.execute(
+        "UPDATE task_main SET top_requirement=?1, global_accept_criteria=?2 WHERE id=?3",
+        params![top_requirement.trim(), accept_criteria.trim(), task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())
 }
 
 /// 取出所有 pending 人工消息并标记 consumed；返回内容用于注入 prompt。
@@ -991,7 +1353,12 @@ pub fn apply_pending_plan(
 
 pub fn set_paused(conn: &Connection, task_id: i64, message: &str) -> Result<(), String> {
     if let Some(mut task) = get_task(conn, task_id)? {
-        task.status = "paused".into();
+        if task.status != "terminated" {
+            task.status = "paused".into();
+            if task.pause_reason.trim().is_empty() {
+                task.pause_reason = "manual".into();
+            }
+        }
         task.cancel_requested = false;
         save_task(conn, &task)?;
         set_cancel_requested(conn, task_id, false)?;
@@ -1004,6 +1371,34 @@ pub fn set_paused(conn: &Connection, task_id: i64, message: &str) -> Result<(), 
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 关闭日志持久化时事件只返回给前端，不写入数据库。
+    #[test]
+    fn log_persistence_off_skips_event_storage() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO task_main(task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
+                coder_agent_ids,module_max_round,global_max_round,work_dir,create_time)
+             VALUES ('t','r','a',1,'[1]',1,1,'/tmp','2026-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        set_log_persistence(false);
+        let ev = add_event(&conn, 1, None, "agent_message:coder", "hello").unwrap();
+        assert!(ev.id < 0);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        set_log_persistence(true);
+        let ev = add_event(&conn, 1, None, "agent_message:coder", "hello").unwrap();
+        assert!(ev.id > 0);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
 
     /// 关键：旧版本数据库必须能无损升级，不能丢 Agent/任务数据。
     #[test]
@@ -1066,9 +1461,15 @@ mod tests {
             assert_eq!(task.task_name, "旧任务");
             assert!(!task.manual_review_enabled);
             assert_eq!(task.tech_stack, "");
+            assert_eq!(task.execution_mode, "immediate");
+            assert!(task.schedule_enabled);
             // 新表存在
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM task_event", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chat_message", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(n, 0);
         }

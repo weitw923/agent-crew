@@ -2,12 +2,15 @@
 
 export type RoleType = "reviewer" | "coder";
 export type TaskStatus =
+  | "pending"
   | "planning"
   | "running"
   | "needs_human"
   | "paused"
+  | "terminated"
   | "completed"
   | "failed";
+export type ExecutionMode = "immediate" | "later" | "scheduled";
 export type TaskPhase = "plan_approval" | "module_dev" | "global_review";
 export type SubtaskStatus = "waiting" | "in_progress" | "completed" | "needs_human";
 export type SubtaskStage =
@@ -108,6 +111,13 @@ export interface TaskMain {
   tech_stack: string;
   pending_plan_json: string;
   cancel_requested: boolean;
+  execution_mode: ExecutionMode;
+  schedule_start: string;
+  schedule_end: string;
+  schedule_enabled: boolean;
+  schedule_override: boolean;
+  start_requested: boolean;
+  pause_reason: string;
 }
 
 export interface TaskLog {
@@ -123,6 +133,14 @@ export interface TaskEvent {
   task_id: number;
   subtask_id: number | null;
   kind: string;
+  content: string;
+  create_time: string;
+}
+
+export interface ChatMessage {
+  id: number;
+  task_id: number;
+  role: "user" | "assistant";
   content: string;
   create_time: string;
 }
@@ -155,6 +173,7 @@ export interface TaskDetail {
   execution_events: TaskEvent[];
   human_messages: HumanMessage[];
   pending_plan: PendingPlan | null;
+  chat_messages: ChatMessage[];
 }
 
 export interface TaskSummary extends TaskMain {
@@ -174,12 +193,20 @@ export interface NewTaskInput {
   global_max_round: number;
   work_dir: string;
   manual_review_enabled: boolean;
+  execution_mode: ExecutionMode;
+  schedule_start: string;
+  schedule_end: string;
+  schedule_enabled: boolean;
 }
 
 export interface RuntimeConfigInput {
   module_max_round: number;
   global_max_round: number;
   manual_review_enabled: boolean;
+  execution_mode: ExecutionMode;
+  schedule_start: string;
+  schedule_end: string;
+  schedule_enabled: boolean;
 }
 
 export interface AppSettings {
@@ -188,4 +215,17 @@ export interface AppSettings {
   dsh_timeout_sec: string;
   dsh_bin: string;
   dsh_profile: string;
+  storage_root: string;
+  log_persistence: boolean;
+  default_execution_mode: ExecutionMode;
+  default_module_max_round: string;
+  default_global_max_round: string;
+  max_concurrent_tasks: string;
+  scheduled_enabled: boolean;
+  llm_rate_limit_per_min: string;
+}
+
+export interface StartOutcome {
+  started: boolean;
+  message: string;
 }

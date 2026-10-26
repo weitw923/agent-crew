@@ -109,6 +109,10 @@ fn build_mock_response(
     code_reviews: &Arc<AtomicUsize>,
     global_reviews: &Arc<AtomicUsize>,
 ) -> String {
+    // 临时问答：普通文本响应，不触发流水线。
+    if body.contains("临时问答会话") || body.contains("用户最新问题") {
+        return "临时问答回复：建议继续保持 JWT + 统一返回体，不要启动新的开发任务。".to_string();
+    }
     // Planner：system prompt 中的关键词。
     if body.contains("软件架构评审者") || body.contains("请输出拆解 JSON") {
         return serde_json::json!({
@@ -285,6 +289,10 @@ fn full_serial_orchestration_flow() {
             global_max_round: 3,
             work_dir: work_dir.to_string_lossy().to_string(),
             manual_review_enabled: false,
+            execution_mode: "immediate".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
         },
     )
     .unwrap();
@@ -329,8 +337,15 @@ fn full_serial_orchestration_flow() {
         detail
             .execution_events
             .iter()
-            .any(|e| e.kind == "dsh_stdout"),
-        "dsh stdout should be streamed into execution events"
+            .any(|e| e.kind == "agent_message:coder" || e.kind == "tool_call"),
+        "structured coder dialogue/tool events should be streamed"
+    );
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.kind == "agent_message:reviewer"),
+        "reviewer dialogue should be recorded"
     );
 
     // 摘要落盘 & 设计文档 & DB 归档
@@ -343,11 +358,16 @@ fn full_serial_orchestration_flow() {
         assert!(sub.summary_content.contains("# 模块名称"));
         assert!(!sub.summary_file_path.is_empty());
         assert!(Path::new(&sub.summary_file_path).exists());
+        assert!(
+            sub.summary_file_path.contains("tasks"),
+            "summary snapshot should live under external task storage"
+        );
         assert!(!sub.iteration_records.is_empty());
     }
     // 工作目录中确实生成了代码文件，说明 mock dsh 被真实调用过。
     assert!(work_dir.join("src").is_dir());
-    assert!(work_dir.join("summaries").is_dir());
+    // 摘要最终快照已移到项目外，项目目录不再残留 summaries。
+    assert!(!work_dir.join("summaries").is_dir());
 }
 
 /// 人工审核模式：方案审批 + 逐模块设计审批 + 人工消息注入。
@@ -412,6 +432,10 @@ fn manual_review_plan_and_design_gates() {
             global_max_round: 3,
             work_dir: work_dir.to_string_lossy().to_string(),
             manual_review_enabled: true,
+            execution_mode: "immediate".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
         },
     )
     .unwrap();
@@ -481,4 +505,125 @@ fn manual_review_plan_and_design_gates() {
         drop(conn);
     }
     panic!("manual review flow did not complete in time");
+}
+
+/// 定时窗口外启动：在派发新模块前自动暂停为 waiting_window。
+#[test]
+fn scheduled_task_pauses_outside_window() {
+    use chrono::{Duration, Local};
+
+    let root = temp_dir("schedule");
+    let app_data = root.join("app-data");
+    let work_dir = root.join("project");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = db::init(&app_data).unwrap();
+    let conn = db::open(&db_path).unwrap();
+
+    let start = (Local::now() + Duration::hours(2))
+        .format("%H:%M")
+        .to_string();
+    let end = (Local::now() + Duration::hours(3))
+        .format("%H:%M")
+        .to_string();
+    let task_id = db::create_task(
+        &conn,
+        &NewTaskInput {
+            task_name: "定时窗口外".into(),
+            top_requirement: "需求".into(),
+            global_accept_criteria: "验收".into(),
+            reviewer_agent_id: 1,
+            coder_agent_ids: vec![1],
+            module_max_round: 3,
+            global_max_round: 2,
+            work_dir: work_dir.to_string_lossy().to_string(),
+            manual_review_enabled: false,
+            execution_mode: "scheduled".into(),
+            schedule_start: start,
+            schedule_end: end,
+            schedule_enabled: true,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id).unwrap();
+    let conn = db::open(&db_path).unwrap();
+    let task = db::get_task(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "paused");
+    assert_eq!(task.pause_reason, "waiting_window");
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subtask WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "outside window must not dispatch a new module");
+}
+
+/// 临时问答必须直接回复，不创建子任务，也不改变任务状态。
+#[test]
+fn chat_channel_does_not_trigger_pipeline() {
+    let root = temp_dir("chat");
+    let app_data = root.join("app-data");
+    let work_dir = root.join("project");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = db::init(&app_data).unwrap();
+    let port = start_mock_llm();
+    let conn = db::open(&db_path).unwrap();
+
+    let reviewer = db::save_agent(
+        &conn,
+        &AgentInput {
+            id: None,
+            name: "Mock Reviewer".into(),
+            role_type: "reviewer".into(),
+            provider: "openai-compatible".into(),
+            model_name: "mock-model".into(),
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            api_key: "test-key".into(),
+            system_prompt: "你是技术总监".into(),
+            temperature: 0.0,
+        },
+    )
+    .unwrap();
+    let mut settings = AppSettings::default();
+    settings.llm_timeout_sec = "15".into();
+    db::save_settings(&conn, &settings).unwrap();
+
+    let task_id = db::create_task(
+        &conn,
+        &NewTaskInput {
+            task_name: "问答隔离测试".into(),
+            top_requirement: "只做问答，不开发".into(),
+            global_accept_criteria: "不创建子任务".into(),
+            reviewer_agent_id: reviewer.id,
+            coder_agent_ids: vec![reviewer.id],
+            module_max_round: 3,
+            global_max_round: 2,
+            work_dir: work_dir.to_string_lossy().to_string(),
+            manual_review_enabled: false,
+            execution_mode: "later".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
+        },
+    )
+    .unwrap();
+
+    let reply =
+        orchestrator::chat_with_connection(&conn, task_id, "这个模块为什么选 JWT？", &settings)
+            .unwrap();
+    assert_eq!(reply.role, "assistant");
+    assert!(reply.content.contains("临时问答回复"));
+
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "pending");
+    assert!(
+        detail.subtasks.is_empty(),
+        "chat must not dispatch subtasks"
+    );
+    assert_eq!(detail.chat_messages.len(), 2);
+    assert_eq!(detail.chat_messages[0].role, "user");
+    assert_eq!(detail.chat_messages[1].role, "assistant");
 }

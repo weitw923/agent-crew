@@ -3,9 +3,12 @@ import type {
   AgentConfig,
   AgentInput,
   AppSettings,
+  ChatMessage,
   NewTaskInput,
   RuntimeConfigInput,
+  StartOutcome,
   TaskDetail,
+  TaskEvent,
   TaskMain,
   TaskSummary
 } from "./types";
@@ -20,9 +23,11 @@ export const importAgents = (path: string) => invoke<number>("import_agents", { 
 // ---------------- 任务 ----------------
 export const listTasks = () => invoke<TaskSummary[]>("list_tasks");
 export const createTask = (input: NewTaskInput) => invoke<number>("create_task", { input });
-export const startTask = (taskId: number) => invoke<void>("start_task", { taskId });
+export const startTask = (taskId: number) => invoke<StartOutcome>("start_task", { taskId });
 export const resumeTask = (taskId: number) => invoke<void>("resume_task", { taskId });
 export const getTaskDetail = (taskId: number) => invoke<TaskDetail>("get_task_detail", { taskId });
+export const listTaskEvents = (taskId: number) =>
+  invoke<TaskEvent[]>("list_task_events", { taskId });
 export const deleteTask = (taskId: number) => invoke<void>("delete_task", { taskId });
 export const humanForcePass = (taskId: number, subtaskId: number) =>
   invoke<void>("human_force_pass", { taskId, subtaskId });
@@ -46,6 +51,22 @@ export const rejectDesign = (taskId: number, subtaskId: number, feedback: string
 export const sendHumanMessage = (taskId: number, content: string) =>
   invoke<void>("send_human_message", { taskId, content });
 export const cancelTask = (taskId: number) => invoke<void>("cancel_task", { taskId });
+export const pauseTask = (taskId: number) => invoke<void>("pause_task", { taskId });
+export const terminateTask = (taskId: number) => invoke<void>("terminate_task", { taskId });
+export const updateRequirements = (
+  taskId: number,
+  topRequirement: string,
+  acceptCriteria: string
+) =>
+  invoke<TaskMain>("update_requirements", {
+    taskId,
+    topRequirement,
+    acceptCriteria
+  });
+export const sendChatMessage = (taskId: number, content: string) =>
+  invoke<ChatMessage>("send_chat_message", { taskId, content });
+export const clearChatMessages = (taskId: number) =>
+  invoke<void>("clear_chat_messages", { taskId });
 
 // ---------------- 设置 ----------------
 export const getSettings = () => invoke<AppSettings>("get_settings");

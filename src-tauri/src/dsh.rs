@@ -430,18 +430,6 @@ pub fn read_summary(work_dir: &Path, rel_path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// 摘要通过后由应用兜底落盘（正常情况下 dsh 已经写入；这里保证文件一定存在）。
-pub fn persist_summary(work_dir: &Path, rel_path: &str, content: &str) -> Result<PathBuf, String> {
-    let path = work_dir.join(rel_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("创建摘要目录失败（{}）: {e}", parent.display()))?;
-    }
-    fs::write(&path, content)
-        .map_err(|e| format!("写入摘要文件失败（{}）: {e}", path.display()))?;
-    Ok(path)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

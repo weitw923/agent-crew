@@ -7,10 +7,11 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::db;
 use crate::models::{
-    AgentConfig, AgentInput, AppSettings, NewTaskInput, TaskConfigInput, TaskDetail, TaskMain,
-    TaskSummary,
+    AgentConfig, AgentInput, AppSettings, ChatMessage, NewTaskInput, StartOutcome, TaskConfigInput,
+    TaskDetail, TaskMain, TaskSummary,
 };
 use crate::orchestrator;
+use crate::storage;
 use crate::AppState;
 
 fn ensure_not_running(app: &AppHandle, task_id: i64) -> Result<(), String> {
@@ -27,25 +28,25 @@ fn ensure_not_running(app: &AppHandle, task_id: i64) -> Result<(), String> {
 // ------------------------------------------------------------------
 #[tauri::command]
 pub fn list_agents(state: State<'_, AppState>) -> Result<Vec<AgentConfig>, String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     db::list_agents(&conn)
 }
 
 #[tauri::command]
 pub fn save_agent(state: State<'_, AppState>, input: AgentInput) -> Result<AgentConfig, String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     db::save_agent(&conn, &input)
 }
 
 #[tauri::command]
 pub fn delete_agent(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     db::delete_agent(&conn, id)
 }
 
 #[tauri::command]
 pub fn export_agents(state: State<'_, AppState>, path: String) -> Result<usize, String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     let agents = db::list_agents(&conn)?;
     let payload = json!({
         "version": 1,
@@ -72,7 +73,7 @@ pub fn import_agents(state: State<'_, AppState>, path: String) -> Result<usize, 
         .or_else(|| value.as_array().cloned())
         .ok_or_else(|| "导入文件缺少 agents 数组".to_string())?;
 
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     let mut count = 0usize;
     for item in arr {
         let mut input: AgentInput =
@@ -92,13 +93,13 @@ pub fn import_agents(state: State<'_, AppState>, path: String) -> Result<usize, 
 // ------------------------------------------------------------------
 #[tauri::command]
 pub fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSummary>, String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     db::list_tasks(&conn)
 }
 
 #[tauri::command]
 pub fn create_task(state: State<'_, AppState>, input: NewTaskInput) -> Result<i64, String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     let reviewer = db::get_agent(&conn, input.reviewer_agent_id)?
         .ok_or_else(|| "评审 Agent 不存在".to_string())?;
     if reviewer.role_type != "reviewer" {
@@ -117,34 +118,26 @@ pub fn create_task(state: State<'_, AppState>, input: NewTaskInput) -> Result<i6
     }
 
     let task_id = db::create_task(&conn, &input)?;
+    let mode_label = match input.execution_mode.as_str() {
+        "immediate" => "立即执行",
+        "scheduled" => "定时执行",
+        _ => "稍后执行",
+    };
     db::add_log(
         &conn,
         task_id,
         "info",
         &format!(
-            "任务创建：{}；评审 Agent「{}」；串行 Coder 使用列表第一个",
-            input.task_name, reviewer.name
+            "任务创建：{}；评审 Agent「{}」；执行模式：{}；串行 Coder 使用列表第一个",
+            input.task_name, reviewer.name, mode_label
         ),
     )?;
     Ok(task_id)
 }
 
 #[tauri::command]
-pub fn start_task(app: AppHandle, task_id: i64) -> Result<(), String> {
-    ensure_not_running(&app, task_id)?;
-    let state = app.state::<AppState>();
-    let conn = db::open(&state.db_path)?;
-    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
-    if task.status == "completed" {
-        return Err("任务已完成".into());
-    }
-    task.status = "planning".into();
-    task.cancel_requested = false;
-    db::save_task(&conn, &task)?;
-    db::set_cancel_requested(&conn, task_id, false)?;
-    db::add_log(&conn, task_id, "info", "任务启动，等待评审 Agent 拆解…")?;
-    drop(conn);
-    orchestrator::spawn_task(app, task_id)
+pub fn start_task(app: AppHandle, task_id: i64) -> Result<StartOutcome, String> {
+    orchestrator::start_task(&app, task_id)
 }
 
 #[tauri::command]
@@ -155,15 +148,24 @@ pub fn resume_task(app: AppHandle, task_id: i64) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_task_detail(state: State<'_, AppState>, task_id: i64) -> Result<TaskDetail, String> {
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     db::get_task_detail(&conn, task_id)
+}
+
+#[tauri::command]
+pub fn list_task_events(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> Result<Vec<crate::models::TaskEvent>, String> {
+    let conn = db::open(&state.db_path()?)?;
+    db::list_all_events(&conn, task_id)
 }
 
 #[tauri::command]
 pub fn delete_task(app: AppHandle, task_id: i64) -> Result<(), String> {
     ensure_not_running(&app, task_id)?;
     let state = app.state::<AppState>();
-    let conn = db::open(&state.db_path)?;
+    let conn = db::open(&state.db_path()?)?;
     db::delete_task(&conn, task_id)
 }
 
@@ -253,13 +255,55 @@ pub fn cancel_task(app: AppHandle, task_id: i64) -> Result<(), String> {
     orchestrator::cancel_task(&app, task_id)
 }
 
+#[tauri::command]
+pub fn pause_task(app: AppHandle, task_id: i64) -> Result<(), String> {
+    orchestrator::pause_task(&app, task_id)
+}
+
+#[tauri::command]
+pub fn terminate_task(app: AppHandle, task_id: i64) -> Result<(), String> {
+    orchestrator::terminate_task(&app, task_id)
+}
+
+#[tauri::command]
+pub fn update_requirements(
+    app: AppHandle,
+    task_id: i64,
+    top_requirement: String,
+    accept_criteria: String,
+) -> Result<TaskMain, String> {
+    orchestrator::update_requirements(&app, task_id, &top_requirement, &accept_criteria)
+}
+
+#[tauri::command]
+pub async fn send_chat_message(
+    app: AppHandle,
+    task_id: i64,
+    content: String,
+) -> Result<ChatMessage, String> {
+    // LLM HTTP 请求放到阻塞线程，避免卡住 Tauri IPC / 页面。
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        orchestrator::send_chat_message(&handle, task_id, &content)
+    })
+    .await
+    .map_err(|e| format!("临时问答线程异常: {e}"))?
+}
+
+#[tauri::command]
+pub fn clear_chat_messages(app: AppHandle, task_id: i64) -> Result<(), String> {
+    orchestrator::clear_chat_messages(&app, task_id)
+}
+
 // ------------------------------------------------------------------
 // 设置
 // ------------------------------------------------------------------
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
-    let conn = db::open(&state.db_path)?;
-    db::get_settings(&conn)
+    let conn = db::open(&state.db_path()?)?;
+    let mut settings = db::get_settings(&conn)?;
+    settings.storage_root = state.storage_root()?.to_string_lossy().to_string();
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -288,7 +332,86 @@ pub fn save_settings(
     if settings.dsh_bin.trim().is_empty() {
         return Err("dsh 可执行文件不能为空".into());
     }
-    let conn = db::open(&state.db_path)?;
-    db::save_settings(&conn, &settings)?;
+    if !matches!(
+        settings.default_execution_mode.as_str(),
+        "immediate" | "later" | "scheduled"
+    ) {
+        return Err("默认执行模式不合法".into());
+    }
+    if settings
+        .max_concurrent_tasks
+        .trim()
+        .parse::<usize>()
+        .map(|v| !(1..=32).contains(&v))
+        .unwrap_or(true)
+    {
+        return Err("最大并发任务数必须是 1–32 的整数".into());
+    }
+    if settings
+        .llm_rate_limit_per_min
+        .trim()
+        .parse::<u64>()
+        .is_err()
+    {
+        return Err("LLM 每分钟请求上限必须是 >=0 的整数".into());
+    }
+    for raw in [
+        &settings.default_module_max_round,
+        &settings.default_global_max_round,
+    ] {
+        if raw.trim().parse::<i64>().map(|v| v < 1).unwrap_or(true) {
+            return Err("默认评审轮次必须是 >=1 的整数".into());
+        }
+    }
+
+    let current_root = state.storage_root()?;
+    let current_db = state.db_path()?;
+    let target_root = if settings.storage_root.trim().is_empty() {
+        state.app_data_dir.clone()
+    } else {
+        PathBuf::from(settings.storage_root.trim())
+    };
+    if !target_root.is_absolute() {
+        return Err("存储路径必须是绝对路径".into());
+    }
+
+    // 存储目录不能落在任一项目工作目录内部，避免任务数据和代码混在一起。
+    {
+        let conn = db::open(&current_db)?;
+        for task in db::list_tasks(&conn)? {
+            let work_dir = PathBuf::from(task.task.work_dir.trim());
+            if !work_dir.as_os_str().is_empty() && target_root.starts_with(&work_dir) {
+                return Err(format!(
+                    "存储目录不能位于任务项目目录内部：{}",
+                    work_dir.display()
+                ));
+            }
+        }
+    }
+
+    let mut effective = settings;
+    if target_root != current_root {
+        let _running_guard = state.running.lock().map_err(|_| "任务锁异常".to_string())?;
+        if !_running_guard.is_empty() {
+            return Err("仍有任务在运行，请先暂停所有任务再迁移存储目录".into());
+        }
+        storage::migrate_root(&current_root, &target_root, &current_db)?;
+        storage::write_pointer(&state.app_data_dir, &target_root)?;
+        state.update_storage(target_root.clone())?;
+        effective.storage_root = target_root.to_string_lossy().to_string();
+    } else {
+        effective.storage_root = current_root.to_string_lossy().to_string();
+    }
+
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    db::save_settings(&conn, &effective)?;
+    db::set_log_persistence(effective.log_persistence);
+    let rpm = effective
+        .llm_rate_limit_per_min
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    crate::llm::set_rate_limit_per_min(rpm);
     db::get_settings(&conn)
 }

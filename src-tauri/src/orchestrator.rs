@@ -22,10 +22,12 @@ use crate::db;
 use crate::dsh;
 use crate::llm;
 use crate::models::{
-    AgentConfig, AppSettings, GlobalReviewIssue, GlobalReviewRecord, PendingPlan, Subtask,
-    TaskConfigInput, TaskMain,
+    AgentConfig, AppSettings, ChatMessage, GlobalReviewIssue, GlobalReviewRecord, PendingPlan,
+    StartOutcome, Subtask, TaskConfigInput, TaskMain,
 };
 use crate::prompts;
+use crate::schedule;
+use crate::storage;
 use crate::AppState;
 
 static RUN_SEQ: AtomicI64 = AtomicI64::new(1);
@@ -173,8 +175,8 @@ pub fn spawn_task(app: AppHandle, task_id: i64) -> Result<(), String> {
     }
     register_cancel(task_id);
 
-    let db_path = app.state::<AppState>().db_path.clone();
-    let app_data_dir = app.state::<AppState>().app_data_dir.clone();
+    let db_path = app.state::<AppState>().db_path()?;
+    let app_data_dir = app.state::<AppState>().storage_root()?;
     let handle = app.clone();
     let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
     let spawn_result = thread::Builder::new()
@@ -184,13 +186,20 @@ pub fn spawn_task(app: AppHandle, task_id: i64) -> Result<(), String> {
             if let Err(err) = &result {
                 if let Ok(conn) = db::open(&db_path) {
                     if is_canceled(task_id) {
-                        let _ = db::set_paused(
-                            &conn,
-                            task_id,
-                            "任务已被人工终止，可点击「恢复调度」继续",
-                        );
+                        let terminated = db::get_task(&conn, task_id)
+                            .ok()
+                            .flatten()
+                            .map(|t| t.status == "terminated")
+                            .unwrap_or(false);
+                        if !terminated {
+                            let _ =
+                                db::set_paused(&conn, task_id, "任务已暂停，可点击「恢复」继续");
+                        }
                     } else if let Ok(Some(mut task)) = db::get_task(&conn, task_id) {
-                        if !matches!(task.status.as_str(), "completed" | "needs_human" | "paused") {
+                        if !matches!(
+                            task.status.as_str(),
+                            "completed" | "needs_human" | "paused" | "terminated"
+                        ) {
                             task.status = "failed".to_string();
                             let _ = db::save_task(&conn, &task);
                         }
@@ -232,6 +241,14 @@ fn emit_update(app: Option<&AppHandle>, task_id: i64) {
 
 fn log(app: Option<&AppHandle>, conn: &Connection, task_id: i64, level: &str, message: &str) {
     let _ = db::add_log(conn, task_id, level, message);
+    // 日志持久化关闭时，仍然把关键日志作为实时事件推送到页面。
+    if !db::log_persistence() {
+        if let Some(handle) = app {
+            let event =
+                db::live_event(task_id, None, "system_log", &format!("[{level}] {message}"));
+            let _ = handle.emit("task-event", json!({ "task_id": task_id, "event": event }));
+        }
+    }
     emit_update(app, task_id);
 }
 
@@ -248,6 +265,14 @@ fn tech_stack_text(task: &TaskMain) -> String {
     } else {
         prompts::truncate_chars(stack, 12_000)
     }
+}
+
+fn requirements_text(task: &TaskMain) -> String {
+    format!(
+        "## 顶层需求\n{}\n\n## 项目验收标准\n{}",
+        prompts::truncate_chars(&task.top_requirement, 20_000),
+        prompts::truncate_chars(&task.global_accept_criteria, 8_000)
+    )
 }
 
 fn agent_system(agent: &AgentConfig, base: &str) -> String {
@@ -286,16 +311,44 @@ fn run_loop(
 
         if matches!(
             task.status.as_str(),
-            "completed" | "failed" | "needs_human" | "paused"
+            "completed" | "failed" | "needs_human" | "paused" | "terminated"
         ) {
             emit_update(app, task_id);
             return Ok(());
         }
 
         if is_canceled(task_id) {
-            db::set_paused(&conn, task_id, "任务已被人工终止，可点击「恢复调度」继续")?;
+            if task.status != "terminated" {
+                db::set_paused(&conn, task_id, "任务已暂停，可点击「恢复调度」继续")?;
+            }
             emit_update(app, task_id);
             return Ok(());
+        }
+
+        // 定时窗口边界：当前模块（含本轮评审/摘要）允许跑完；在派发下一个新模块前
+        // 如果已经离开窗口，则自动暂停等待下一个窗口。
+        if task.execution_mode == "scheduled"
+            && task.schedule_enabled
+            && !task.schedule_override
+            && !schedule::now_in_window(&task.schedule_start, &task.schedule_end)
+        {
+            let active = db::list_subtasks(&conn, task_id)?
+                .iter()
+                .any(|s| s.status == "in_progress" || s.status == "needs_human");
+            if !active {
+                task.status = "paused".into();
+                task.pause_reason = "waiting_window".into();
+                db::save_task(&conn, &task)?;
+                log(
+                    app,
+                    &conn,
+                    task_id,
+                    "info",
+                    "已离开定时执行窗口：当前模块已收尾，等待下一个时间窗口自动继续",
+                );
+                emit_update(app, task_id);
+                return Ok(());
+            }
         }
 
         // 拆解恢复保护：只要还没有全局契约且没有任何子任务，就一定是拆解未完成
@@ -549,6 +602,23 @@ fn do_plan(
         }
     }
     let plan = parsed.ok_or_else(|| format!("拆解结果多次校验失败：{last_error}"))?;
+    record_event(
+        app,
+        conn,
+        task.id,
+        None,
+        "agent_message:reviewer",
+        &format!(
+            "技术总监完成拆解：{} 个模块，技术栈与全局契约已生成。\n模块列表：{}",
+            plan.subtasks.len(),
+            plan.subtasks
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("#{} {}", i + 1, s.name))
+                .collect::<Vec<_>>()
+                .join("；")
+        ),
+    );
 
     let first_coder = task
         .coder_agent_ids
@@ -674,7 +744,9 @@ fn do_module_step(
     mut sub: Subtask,
 ) -> Result<(), String> {
     match sub.current_stage.as_str() {
-        "design_generation" => design_generation_step(app, conn, settings, task, &mut sub),
+        "design_generation" => {
+            design_generation_step(app, conn, app_data_dir, settings, task, &mut sub)
+        }
         "design_approval" => {
             // 只有人工审批通过命令才会把 stage 改为 coding；
             // 走到这里说明仍在等待审批。
@@ -690,11 +762,11 @@ fn do_module_step(
             Ok(())
         }
         "coding" => coder_step(app, conn, app_data_dir, settings, task, &mut sub),
-        "code_review" => code_review_step(app, conn, settings, task, &mut sub),
+        "code_review" => code_review_step(app, conn, app_data_dir, settings, task, &mut sub),
         "summary_generation" => {
             summary_generation_step(app, conn, app_data_dir, settings, task, &mut sub)
         }
-        "summary_review" => summary_review_step(app, conn, settings, task, &mut sub),
+        "summary_review" => summary_review_step(app, conn, app_data_dir, settings, task, &mut sub),
         other => Err(format!("非法子任务阶段: {other}")),
     }
 }
@@ -707,6 +779,7 @@ struct DesignOutput {
 fn design_generation_step(
     app: Option<&AppHandle>,
     conn: &Connection,
+    app_data_dir: &Path,
     settings: &AppSettings,
     task: &mut TaskMain,
     sub: &mut Subtask,
@@ -764,6 +837,15 @@ fn design_generation_step(
         return Err(format!("模块设计多次校验失败：{last_error}"));
     }
     sub.design_content = design;
+    if let Err(e) = storage::save_design(app_data_dir, task.id, sub, &sub.design_content) {
+        log(
+            app,
+            conn,
+            task.id,
+            "warn",
+            &format!("设计快照写入外部存储失败：{e}"),
+        );
+    }
     record_event(
         app,
         conn,
@@ -818,6 +900,111 @@ fn parse_design_output(value: &Value) -> Result<String, String> {
     Ok(doc)
 }
 
+/// 把 dsh 的 NDJSON 事件压缩成页面上可读的 Agent 对话 / 工具调用事件。
+fn record_dsh_line(
+    app: Option<&AppHandle>,
+    conn: &Connection,
+    task_id: i64,
+    subtask_id: i64,
+    line: &str,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        record_event(
+            app,
+            conn,
+            task_id,
+            Some(subtask_id),
+            "dsh_raw",
+            &prompts::truncate_chars(trimmed, 2000),
+        );
+        return;
+    };
+    match value.get("type").and_then(Value::as_str).unwrap_or("") {
+        "text" => {
+            let text = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !text.is_empty() && text != "SUMMARY_DONE" {
+                record_event(
+                    app,
+                    conn,
+                    task_id,
+                    Some(subtask_id),
+                    "agent_message:coder",
+                    text,
+                );
+            }
+        }
+        "tool_call" => {
+            let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let input = value.get("input").cloned().unwrap_or(Value::Null);
+            let content = json!({ "tool": tool, "input": input }).to_string();
+            record_event(
+                app,
+                conn,
+                task_id,
+                Some(subtask_id),
+                "tool_call",
+                &prompts::truncate_chars(&content, 5000),
+            );
+        }
+        "tool_result" => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let result = value.get("result").cloned().unwrap_or(Value::Null);
+            let text = match result {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            let content = json!({ "status": status, "result": text }).to_string();
+            record_event(
+                app,
+                conn,
+                task_id,
+                Some(subtask_id),
+                "tool_result",
+                &prompts::truncate_chars(&content, 4000),
+            );
+        }
+        "final" => {
+            let text = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !text.is_empty() && text != "SUMMARY_DONE" {
+                record_event(
+                    app,
+                    conn,
+                    task_id,
+                    Some(subtask_id),
+                    "agent_message:coder",
+                    &prompts::truncate_chars(text, 5000),
+                );
+            }
+        }
+        "error" => {
+            record_event(
+                app,
+                conn,
+                task_id,
+                Some(subtask_id),
+                "dsh_error",
+                &prompts::truncate_chars(trimmed, 3000),
+            );
+        }
+        _ => {}
+    }
+}
+
 fn coder_step(
     app: Option<&AppHandle>,
     conn: &Connection,
@@ -845,6 +1032,7 @@ fn coder_step(
         prompts::coder_implementation_user(
             &tech_stack_text(task),
             &prompts::truncate_chars(&task.global_contract, 20_000),
+            &requirements_text(task),
             &prompts::truncate_chars(&sub.design_content, 40_000),
             &prompts::truncate_chars(&completed, 50_000),
             sub,
@@ -869,7 +1057,7 @@ fn coder_step(
     let timeout = parse_u64(&settings.dsh_timeout_sec, 1800, 30, 86_400);
     let sub_id = sub.id;
     let mut on_stdout = |line: &str| {
-        record_event(app, conn, task.id, Some(sub_id), "dsh_stdout", line);
+        record_dsh_line(app, conn, task.id, sub_id, line);
     };
     let result = dsh::run_coder(
         app_data_dir,
@@ -912,6 +1100,21 @@ fn coder_step(
     }
 
     let diff = dsh::diff_since(Path::new(&task.work_dir), &baseline)?;
+    if let Err(e) = storage::save_round_diff(
+        app_data_dir,
+        task.id,
+        sub,
+        sub.current_round,
+        &prompts::truncate_chars(&diff, MAX_CODE_DIFF_CHARS),
+    ) {
+        log(
+            app,
+            conn,
+            task.id,
+            "warn",
+            &format!("diff 快照写入外部存储失败：{e}"),
+        );
+    }
     record_event(
         app,
         conn,
@@ -952,6 +1155,7 @@ fn coder_step(
 fn code_review_step(
     app: Option<&AppHandle>,
     conn: &Connection,
+    storage_root: &Path,
     settings: &AppSettings,
     task: &mut TaskMain,
     sub: &mut Subtask,
@@ -976,6 +1180,7 @@ fn code_review_step(
         let human = human_instructions(app, conn, task.id);
         let mut user = prompts::code_review_user(
             &prompts::truncate_chars(&task.global_contract, 20_000),
+            &requirements_text(task),
             &prompts::truncate_chars(&completed, 50_000),
             sub,
             &prompts::truncate_chars(&diff, MAX_CODE_DIFF_CHARS),
@@ -997,6 +1202,18 @@ fn code_review_step(
     };
 
     update_last_record(sub, &feedback, if passed { "pass" } else { "reject" });
+    if let Some(rec) = sub.iteration_records.last() {
+        if let Ok(text) = serde_json::to_string_pretty(rec) {
+            let _ = storage::save_review_snapshot(
+                storage_root,
+                task.id,
+                sub,
+                sub.current_round,
+                "code-review",
+                &text,
+            );
+        }
+    }
     if passed {
         sub.current_stage = "summary_generation".into();
         sub.status = "in_progress".into();
@@ -1071,6 +1288,7 @@ fn summary_generation_step(
     for attempt in 0..2 {
         let base_prompt = prompts::coder_summary_user(
             &prompts::truncate_chars(&task.global_contract, 20_000),
+            &requirements_text(task),
             sub,
             &rel_path,
             &current_feedback,
@@ -1098,7 +1316,7 @@ fn summary_generation_step(
         let timeout = parse_u64(&settings.dsh_timeout_sec, 1800, 30, 86_400);
         let sub_id = sub.id;
         let mut on_stdout = |line: &str| {
-            record_event(app, conn, task.id, Some(sub_id), "dsh_stdout", line);
+            record_dsh_line(app, conn, task.id, sub_id, line);
         };
         let result = dsh::run_coder(
             app_data_dir,
@@ -1208,6 +1426,7 @@ fn summary_generation_step(
 fn summary_review_step(
     app: Option<&AppHandle>,
     conn: &Connection,
+    storage_root: &Path,
     settings: &AppSettings,
     task: &mut TaskMain,
     sub: &mut Subtask,
@@ -1266,6 +1485,18 @@ fn summary_review_step(
     )?;
 
     update_last_record(sub, &feedback, if passed { "pass" } else { "reject" });
+    if let Some(rec) = sub.iteration_records.last() {
+        if let Ok(text) = serde_json::to_string_pretty(rec) {
+            let _ = storage::save_review_snapshot(
+                storage_root,
+                task.id,
+                sub,
+                sub.current_round,
+                "summary-review",
+                &text,
+            );
+        }
+    }
     if !passed {
         log(
             app,
@@ -1282,12 +1513,9 @@ fn summary_review_step(
         return handle_summary_reject(app, conn, task, sub, &feedback);
     }
 
-    // 摘要校验通过：强制落盘、归档、标记完成。
-    let path = dsh::persist_summary(
-        Path::new(&task.work_dir),
-        &dsh::summary_rel_path(sub),
-        &summary,
-    )?;
+    // 摘要校验通过：快照写入外部存储根目录（项目目录只保留代码），并归档。
+    let path = storage::persist_summary(storage_root, task.id, sub, &summary)?;
+    storage::remove_project_summary(Path::new(&task.work_dir), &dsh::summary_rel_path(sub));
     sub.summary_content = summary;
     sub.summary_file_path = path.to_string_lossy().to_string();
     sub.status = "completed".into();
@@ -1483,6 +1711,7 @@ fn do_global_step(
     let summaries = db::completed_summaries(subtasks);
     let base_user = prompts::global_review_user(
         &prompts::truncate_chars(&task.global_contract, 25_000),
+        &prompts::truncate_chars(&task.top_requirement, 20_000),
         &prompts::truncate_chars(&summaries, 60_000),
         &prompts::truncate_chars(&cumulative_diff, MAX_GLOBAL_DIFF_CHARS),
         &task.global_accept_criteria,
@@ -1557,6 +1786,19 @@ fn do_global_step(
         created_at: db::now(),
     };
     task.global_review_records.push(record);
+    record_event(
+        app,
+        conn,
+        task.id,
+        None,
+        "agent_message:reviewer",
+        &format!(
+            "全局评审第 {} 轮：{}\n{}",
+            task.current_global_round,
+            if output.passed { "通过" } else { "不通过" },
+            output.feedback.trim()
+        ),
+    );
 
     if output.passed {
         task.status = "completed".into();
@@ -1731,7 +1973,26 @@ fn call_reviewer(
             llm_timeout_sec,
         )?;
         match parse_review_output(&value) {
-            Ok(result) => return Ok(result),
+            Ok((passed, feedback)) => {
+                let text = format!(
+                    "评审结论：{}\n{}",
+                    if passed { "通过" } else { "不通过" },
+                    if feedback.trim().is_empty() {
+                        "（无补充意见）"
+                    } else {
+                        feedback.trim()
+                    }
+                );
+                record_event(
+                    app,
+                    conn,
+                    task_id,
+                    subtask_id,
+                    "agent_message:reviewer",
+                    &text,
+                );
+                return Ok((passed, feedback));
+            }
             Err(e) => {
                 last_error = e.clone();
                 log(
@@ -1771,6 +2032,17 @@ fn parse_review_output(value: &Value) -> Result<(bool, String), String> {
 // 无 UI 执行入口（供集成测试使用；生产走 spawn_task）
 // ------------------------------------------------------------------
 pub fn run_task_headless(db_path: &Path, app_data_dir: &Path, task_id: i64) -> Result<(), String> {
+    // 测试入口：把待运行任务直接推进到 planning，模拟调度器启动。
+    if let Ok(conn) = db::open(db_path) {
+        if let Ok(Some(mut task)) = db::get_task(&conn, task_id) {
+            if task.status == "pending" {
+                task.status = "planning".into();
+                task.start_requested = false;
+                task.pause_reason.clear();
+                let _ = db::save_task(&conn, &task);
+            }
+        }
+    }
     register_cancel(task_id);
     let result = run_loop(None, db_path, app_data_dir, task_id);
     remove_cancel(task_id);
@@ -1791,7 +2063,7 @@ fn load_pending_plan(task: &TaskMain) -> Result<PendingPlan, String> {
 pub fn approve_plan(app: Option<&AppHandle>, task_id: i64) -> Result<(), String> {
     let handle = app;
     let db_path = if let Some(h) = handle {
-        h.state::<AppState>().db_path.clone()
+        h.state::<AppState>().db_path()?
     } else {
         return Err("缺少 UI 上下文".into());
     };
@@ -1833,7 +2105,7 @@ pub fn reject_plan(app: Option<&AppHandle>, task_id: i64, feedback: &str) -> Res
         return Err("驳回意见不能为空".into());
     }
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if task.task_phase != "plan_approval" {
@@ -1875,7 +2147,7 @@ pub fn approve_design(
     subtask_id: i64,
 ) -> Result<(), String> {
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     let mut sub = db::get_subtask(&conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
@@ -1924,7 +2196,7 @@ pub fn reject_design(
         return Err("设计修改意见不能为空".into());
     }
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     let mut sub = db::get_subtask(&conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
@@ -1970,7 +2242,7 @@ pub fn update_runtime_config(
     cfg: &TaskConfigInput,
 ) -> Result<TaskMain, String> {
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let current = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if current.status == "completed" {
@@ -1984,14 +2256,18 @@ pub fn update_runtime_config(
         None,
         "config_updated",
         &format!(
-            "运行中配置已更新：模块轮次={}，全局轮次={}，人工审核={}",
+            "运行中配置已更新：模块轮次={}，全局轮次={}，人工审核={}，执行模式={}，窗口={}-{}（{}）",
             cfg.module_max_round,
             cfg.global_max_round,
             if cfg.manual_review_enabled {
                 "开启"
             } else {
                 "关闭"
-            }
+            },
+            cfg.execution_mode,
+            cfg.schedule_start,
+            cfg.schedule_end,
+            if cfg.schedule_enabled { "启用" } else { "关闭" }
         ),
     );
     log(
@@ -2000,14 +2276,17 @@ pub fn update_runtime_config(
         task_id,
         "info",
         &format!(
-            "运行中配置更新：模块最大轮次 {}，全局最大轮次 {}，人工审核 {}",
+            "运行中配置更新：模块最大轮次 {}，全局最大轮次 {}，人工审核 {}，执行模式 {}，窗口 {}-{}",
             cfg.module_max_round,
             cfg.global_max_round,
             if cfg.manual_review_enabled {
                 "开启"
             } else {
                 "关闭"
-            }
+            },
+            cfg.execution_mode,
+            cfg.schedule_start,
+            cfg.schedule_end
         ),
     );
 
@@ -2069,7 +2348,7 @@ pub fn send_human_message(
         return Err("消息不能为空".into());
     }
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if task.status == "completed" {
@@ -2098,41 +2377,124 @@ pub fn send_human_message(
 }
 
 pub fn cancel_task(app: &AppHandle, task_id: i64) -> Result<(), String> {
-    request_cancel(task_id);
-    let db_path = app.state::<AppState>().db_path.clone();
+    // 兼容旧前端：旧版【终止执行】语义等同于可恢复的暂停。
+    pause_task(app, task_id)
+}
+
+/// 任务运行中修改顶层需求与验收标准。新需求会作为人工消息注入下一个 Agent 步骤。
+pub fn update_requirements(
+    app: &AppHandle,
+    task_id: i64,
+    top_requirement: &str,
+    accept_criteria: &str,
+) -> Result<TaskMain, String> {
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
     let conn = db::open(&db_path)?;
-    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
-    if task.status == "completed" {
-        return Err("任务已完成，无法终止".into());
+    let current = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    if current.status == "completed" {
+        return Err("任务已完成，无法修改需求".into());
     }
-    let is_running = app
-        .state::<AppState>()
-        .running
-        .lock()
-        .map(|set| set.contains(&task_id))
-        .unwrap_or(false);
-    if is_running {
-        task.cancel_requested = true;
-        db::save_task(&conn, &task)?;
-        log(
-            Some(app),
-            &conn,
-            task_id,
-            "warn",
-            "收到人工终止请求：正在停止当前 dsh/LLM 步骤…",
-        );
-    } else {
-        task.status = "paused".into();
-        task.cancel_requested = false;
-        db::save_task(&conn, &task)?;
-        log(
-            Some(app),
-            &conn,
-            task_id,
-            "warn",
-            "任务已人工终止（未在运行），可点击「恢复调度」继续",
-        );
+    let task = db::update_requirements(&conn, task_id, top_requirement, accept_criteria)?;
+    let message = format!(
+        "【需求已更新】\n## 最新顶层需求\n{}\n\n## 最新项目验收标准\n{}",
+        task.top_requirement, task.global_accept_criteria
+    );
+    db::add_human_message(&conn, task_id, &message)?;
+    record_event(
+        Some(app),
+        &conn,
+        task_id,
+        None,
+        "requirements_updated",
+        &message,
+    );
+    log(
+        Some(app),
+        &conn,
+        task_id,
+        "warn",
+        "需求与验收标准已更新，将在下一个 Agent 步骤注入最新内容",
+    );
+    emit_update(Some(app), task_id);
+    Ok(task)
+}
+
+/// 临时问答通道：独立会话，只调用 Agent 文本回复，不写入流水线事件、不触发调度。
+/// 临时问答核心逻辑：不依赖 AppHandle，便于集成测试。
+pub fn chat_with_connection(
+    conn: &Connection,
+    task_id: i64,
+    content: &str,
+    settings: &AppSettings,
+) -> Result<ChatMessage, String> {
+    if content.trim().is_empty() {
+        return Err("问题不能为空".into());
     }
+    let task = db::get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
+        .ok_or_else(|| "任务绑定的技术总监 Agent 不存在".to_string())?;
+
+    let previous = db::list_chat_messages(conn, task_id, 12)?;
+    let history = previous
+        .iter()
+        .map(|m| {
+            format!(
+                "{}：{}",
+                if m.role == "user" {
+                    "用户"
+                } else {
+                    "技术顾问"
+                },
+                prompts::truncate_chars(&m.content, 3000)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let subtasks = db::list_subtasks(conn, task_id)?;
+    let summaries = db::completed_summaries(&subtasks);
+    let user_prompt = prompts::chat_user(
+        &task.task_name,
+        &task.top_requirement,
+        &task.global_accept_criteria,
+        &task.global_contract,
+        &summaries,
+        &history,
+        content.trim(),
+    );
+    let system = agent_system(&reviewer, &prompts::chat_system());
+
+    db::add_chat_message(conn, task_id, "user", content.trim())?;
+    let reply = match llm::chat_text(&reviewer, &system, &user_prompt, &settings.llm_timeout_sec) {
+        Ok(text) => text,
+        Err(e) => {
+            let _ = db::add_log(conn, task_id, "error", &format!("临时问答调用失败：{e}"));
+            return Err(format!("临时问答失败：{e}"));
+        }
+    };
+    db::add_chat_message(conn, task_id, "assistant", &reply)
+}
+
+/// 临时问答通道：独立会话，只调用 Agent 文本回复，不写入流水线事件、不触发调度。
+pub fn send_chat_message(
+    app: &AppHandle,
+    task_id: i64,
+    content: &str,
+) -> Result<ChatMessage, String> {
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    let settings = db::get_settings(&conn)?;
+    let message = chat_with_connection(&conn, task_id, content, &settings)?;
+    emit_update(Some(app), task_id);
+    Ok(message)
+}
+
+pub fn clear_chat_messages(app: &AppHandle, task_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    db::clear_chat_messages(&conn, task_id)?;
     emit_update(Some(app), task_id);
     Ok(())
 }
@@ -2143,7 +2505,7 @@ pub fn human_force_pass(
     subtask_id: i64,
 ) -> Result<(), String> {
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     let mut sub = db::get_subtask(&conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
@@ -2176,11 +2538,12 @@ pub fn human_force_pass(
                 .map(|r| r.summary_content.clone())
                 .unwrap_or_default();
             update_last_record(&mut sub, "人工强制通过摘要校验", "pass");
-            let path = dsh::persist_summary(
+            let storage_root = handle.state::<AppState>().storage_root()?;
+            let path = storage::persist_summary(&storage_root, task.id, &sub, &summary)?;
+            storage::remove_project_summary(
                 Path::new(&task.work_dir),
                 &dsh::summary_rel_path(&sub),
-                &summary,
-            )?;
+            );
             sub.summary_content = summary;
             sub.summary_file_path = path.to_string_lossy().to_string();
             sub.status = "completed".into();
@@ -2219,7 +2582,7 @@ pub fn human_reject(
         return Err("人工修改意见不能为空".into());
     }
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     let mut sub = db::get_subtask(&conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
@@ -2277,13 +2640,152 @@ pub fn human_reject(
     spawn_task(handle.clone(), task_id)
 }
 
+fn start_status(conn: &Connection, task: &TaskMain) -> Result<String, String> {
+    let subtasks = db::list_subtasks(conn, task.id)?;
+    Ok(
+        if task.global_contract.trim().is_empty() && subtasks.is_empty() {
+            "planning".to_string()
+        } else {
+            "running".to_string()
+        },
+    )
+}
+
+fn running_count(app: &AppHandle) -> usize {
+    app.state::<AppState>()
+        .running
+        .lock()
+        .map(|set| set.len())
+        .unwrap_or(0)
+}
+
+fn max_concurrent(settings: &AppSettings) -> usize {
+    settings
+        .max_concurrent_tasks
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(1)
+        .clamp(1, 32)
+}
+
+fn mark_and_spawn(
+    app: &AppHandle,
+    conn: &Connection,
+    mut task: TaskMain,
+    manual: bool,
+) -> Result<(), String> {
+    task.status = start_status(conn, &task)?;
+    task.cancel_requested = false;
+    task.start_requested = false;
+    task.pause_reason.clear();
+    if manual {
+        task.schedule_override = task.execution_mode == "scheduled";
+    } else {
+        task.schedule_override = false;
+    }
+    db::save_task(conn, &task)?;
+    db::set_cancel_requested(conn, task.id, false)?;
+    log(
+        Some(app),
+        conn,
+        task.id,
+        "info",
+        if manual {
+            "任务由人工启动，等待 Agent 继续执行…"
+        } else {
+            "任务由调度器启动，等待 Agent 继续执行…"
+        },
+    );
+    emit_update(Some(app), task.id);
+    if let Err(e) = orchestrator_spawn(app, task.id) {
+        if let Ok(Some(mut failed)) = db::get_task(conn, task.id) {
+            failed.status = "failed".into();
+            let _ = db::save_task(conn, &failed);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn orchestrator_spawn(app: &AppHandle, task_id: i64) -> Result<(), String> {
+    spawn_task(app.clone(), task_id)
+}
+
+/// 人工点击【运行】：立即执行 / 稍后执行 / 定时执行都从这里进入。
+/// 并发上限已满时会转为等待队列，不会静默超发。
+pub fn start_task(app: &AppHandle, task_id: i64) -> Result<StartOutcome, String> {
+    if app
+        .state::<AppState>()
+        .running
+        .lock()
+        .map(|s| s.contains(&task_id))
+        .unwrap_or(false)
+    {
+        return Ok(StartOutcome {
+            started: true,
+            message: "任务已在运行中".into(),
+        });
+    }
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    let task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    if task.status == "completed" {
+        return Err("任务已完成".into());
+    }
+    if task.status == "terminated" {
+        return Err("任务已终止，无法再次运行".into());
+    }
+    if task.task_phase == "plan_approval" {
+        return Err("方案正在等待人工审批".into());
+    }
+    if db::list_subtasks(&conn, task_id)?
+        .iter()
+        .any(|s| s.current_stage == "design_approval")
+    {
+        return Err("模块设计正在等待人工审批".into());
+    }
+    let settings = db::get_settings(&conn)?;
+    if running_count(app) >= max_concurrent(&settings) {
+        let mut queued = task;
+        queued.status = "pending".into();
+        queued.start_requested = true;
+        queued.pause_reason = "concurrency".into();
+        db::save_task(&conn, &queued)?;
+        log(
+            Some(app),
+            &conn,
+            task_id,
+            "warn",
+            &format!(
+                "已达到最大并发任务数（{}），任务进入等待队列，有空位后自动启动",
+                max_concurrent(&settings)
+            ),
+        );
+        emit_update(Some(app), task_id);
+        return Ok(StartOutcome {
+            started: false,
+            message: "已达到最大并发任务数，任务已进入等待队列".into(),
+        });
+    }
+    let display_name = task.task_name.clone();
+    mark_and_spawn(app, &conn, task, true)?;
+    Ok(StartOutcome {
+        started: true,
+        message: format!("任务「{display_name}」已启动"),
+    })
+}
+
 pub fn resume_task(app: Option<&AppHandle>, task_id: i64) -> Result<(), String> {
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
-    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    let task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if task.status == "completed" {
         return Err("任务已完成，无需恢复".into());
+    }
+    if task.status == "terminated" {
+        return Err("任务已终止，无法恢复".into());
     }
     if task.task_phase == "plan_approval" {
         return Err("方案正在等待人工审批，请先点击「同意方案」或「驳回方案」".into());
@@ -2294,31 +2796,169 @@ pub fn resume_task(app: Option<&AppHandle>, task_id: i64) -> Result<(), String> 
     {
         return Err("模块设计正在等待人工审批，请先审批设计文档".into());
     }
-    task.cancel_requested = false;
-    db::set_cancel_requested(&conn, task_id, false)?;
-    // 如果此前在拆解阶段失败/中断（还没有契约和子任务），恢复时重新进入 planning，
-    // 否则会误进入 module_dev 并因空队列报错。
-    let subtasks = db::list_subtasks(&conn, task_id)?;
-    if task.global_contract.trim().is_empty() && subtasks.is_empty() {
-        task.status = "planning".into();
-    } else {
-        task.status = "running".into();
-    }
-    db::save_task(&conn, &task)?;
-    log(
-        app,
-        &conn,
-        task_id,
-        "info",
-        "人工恢复调度，从持久化状态继续执行",
-    );
     drop(conn);
-    spawn_task(handle.clone(), task_id)
+    let outcome = start_task(handle, task_id)?;
+    if !outcome.started {
+        return Err(outcome.message);
+    }
+    Ok(())
 }
 
+/// 人工暂停：立即停止当前 LLM/dsh，但保留恢复能力与全部数据。
+pub fn pause_task(app: &AppHandle, task_id: i64) -> Result<(), String> {
+    request_cancel(task_id);
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    if task.status == "completed" {
+        return Err("任务已完成，无法暂停".into());
+    }
+    if task.status == "terminated" {
+        return Err("任务已终止".into());
+    }
+    task.pause_reason = "manual".into();
+    let is_running = app
+        .state::<AppState>()
+        .running
+        .lock()
+        .map(|set| set.contains(&task_id))
+        .unwrap_or(false);
+    if is_running {
+        task.cancel_requested = true;
+        db::save_task(&conn, &task)?;
+        log(
+            Some(app),
+            &conn,
+            task_id,
+            "warn",
+            "收到人工暂停请求：正在停止当前 dsh/LLM 步骤…",
+        );
+    } else {
+        task.status = "paused".into();
+        task.cancel_requested = false;
+        db::save_task(&conn, &task)?;
+        log(
+            Some(app),
+            &conn,
+            task_id,
+            "warn",
+            "任务已人工暂停，可点击「恢复」继续",
+        );
+    }
+    emit_update(Some(app), task_id);
+    Ok(())
+}
+
+/// 人工终止：终止后不再派发任何新子任务，状态保留为 terminated。
+pub fn terminate_task(app: &AppHandle, task_id: i64) -> Result<(), String> {
+    request_cancel(task_id);
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    if task.status == "completed" {
+        return Err("任务已完成，无法终止".into());
+    }
+    task.status = "terminated".into();
+    task.pause_reason = "terminated".into();
+    task.cancel_requested = true;
+    task.start_requested = false;
+    task.schedule_override = false;
+    db::save_task(&conn, &task)?;
+    log(
+        Some(app),
+        &conn,
+        task_id,
+        "warn",
+        "任务已人工终止：不会再派发新的子任务，历史数据与模块快照保留",
+    );
+    emit_update(Some(app), task_id);
+    Ok(())
+}
+
+/// 由后台调度线程每 20 秒调用：处理定时窗口、并发队列和立即执行补启动。
+pub fn scheduler_tick(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(db_path) = state.db_path() else {
+        return;
+    };
+    let Ok(conn) = db::open(&db_path) else {
+        return;
+    };
+    let Ok(settings) = db::get_settings(&conn) else {
+        return;
+    };
+    let mut slots = max_concurrent(&settings).saturating_sub(running_count(app));
+    if slots == 0 {
+        return;
+    }
+    let Ok(tasks) = db::list_tasks(&conn) else {
+        return;
+    };
+    for summary in tasks {
+        if slots == 0 {
+            break;
+        }
+        let task = summary.task;
+        let running = app
+            .state::<AppState>()
+            .running
+            .lock()
+            .map(|set| set.contains(&task.id))
+            .unwrap_or(false);
+        if running {
+            continue;
+        }
+        let scheduled_ok = task.execution_mode == "scheduled"
+            && task.schedule_enabled
+            && settings.scheduled_enabled
+            && schedule::now_in_window(&task.schedule_start, &task.schedule_end);
+        let should_start = match task.status.as_str() {
+            "pending" => task.start_requested || task.execution_mode == "immediate" || scheduled_ok,
+            "paused" => task.pause_reason == "waiting_window" && scheduled_ok,
+            _ => false,
+        };
+        if !should_start {
+            continue;
+        }
+        let mut start = task.clone();
+        start.status = match start_status(&conn, &start) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        start.cancel_requested = false;
+        start.start_requested = false;
+        start.pause_reason.clear();
+        start.schedule_override = false;
+        if db::save_task(&conn, &start).is_err() {
+            continue;
+        }
+        log(
+            Some(app),
+            &conn,
+            start.id,
+            "info",
+            if scheduled_ok {
+                "定时窗口已开启：自动继续任务"
+            } else {
+                "并发队列有空位：自动启动任务"
+            },
+        );
+        emit_update(Some(app), start.id);
+        if spawn_task(app.clone(), start.id).is_ok() {
+            slots -= 1;
+        } else if let Ok(Some(mut failed)) = db::get_task(&conn, start.id) {
+            failed.status = "failed".into();
+            let _ = db::save_task(&conn, &failed);
+        }
+    }
+}
 pub fn global_human_force_pass(app: Option<&AppHandle>, task_id: i64) -> Result<(), String> {
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if task.task_phase != "global_review" {
@@ -2357,7 +2997,7 @@ pub fn global_human_rework(
         return Err("返工意见不能为空".into());
     }
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
-    let db_path = handle.state::<AppState>().db_path.clone();
+    let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
     let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if task.task_phase != "global_review" {

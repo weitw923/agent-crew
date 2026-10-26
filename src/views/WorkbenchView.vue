@@ -2,20 +2,26 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import SubtaskCard from "../components/SubtaskCard.vue";
-import type { Subtask, TaskDetail, TaskEvent } from "../types";
+import ConversationPanel from "../components/ConversationPanel.vue";
+import ChatPanel from "../components/ChatPanel.vue";
+import RequirementsModal from "../components/RequirementsModal.vue";
+import type { ExecutionMode, Subtask, TaskDetail, TaskEvent, TaskMain } from "../types";
 import {
   approveDesign,
   approvePlan,
-  cancelTask,
   getTaskDetail,
+  listTaskEvents,
   globalHumanForcePass,
   globalHumanRework,
   humanForcePass,
   humanReject,
+  pauseTask,
   rejectDesign,
   rejectPlan,
   resumeTask,
   sendHumanMessage,
+  startTask,
+  terminateTask,
   updateTaskConfig
 } from "../api";
 import { errorMessage, showToast } from "../toast";
@@ -45,8 +51,15 @@ const showConfig = ref(false);
 const configForm = reactive({
   module_max_round: 3,
   global_max_round: 2,
-  manual_review_enabled: false
+  manual_review_enabled: false,
+  execution_mode: "later" as ExecutionMode,
+  schedule_start: "01:00",
+  schedule_end: "06:00",
+  schedule_enabled: true
 });
+
+const showChat = ref(false);
+const showRequirements = ref(false);
 
 const humanMessage = ref("");
 const contractOpen = ref(true);
@@ -89,49 +102,101 @@ const pendingMessages = computed(
   () => (detail.value?.human_messages ?? []).filter((m) => m.status === "pending")
 );
 const executionEvents = computed(() => detail.value?.execution_events ?? []);
-const visibleEvents = computed(() => executionEvents.value.slice(-300));
+const allEvents = ref<TaskEvent[]>([]);
 const pendingPlan = computed(() => detail.value?.pending_plan ?? null);
+const isPending = computed(() => task.value?.status === "pending");
+const isTerminated = computed(() => task.value?.status === "terminated");
+const canRun = computed(
+  () =>
+    !!task.value &&
+    (task.value.status === "pending" || task.value.status === "failed") &&
+    !isPlanApproval.value &&
+    !isDesignAwaiting.value
+);
 const canResume = computed(
   () =>
     !!task.value &&
     !isRunning.value &&
-    task.value.status !== "completed" &&
+    (task.value.status === "paused" || task.value.status === "needs_human") &&
     !isPlanApproval.value &&
     !isDesignAwaiting.value
 );
-const canCancel = computed(
+const canPause = computed(
+  () => !!task.value && (task.value.status === "running" || task.value.status === "planning")
+);
+const canTerminate = computed(
   () =>
     !!task.value &&
     task.value.status !== "completed" &&
-    task.value.status !== "paused" &&
-    task.value.status !== "failed"
+    task.value.status !== "terminated"
 );
 const canHuman = computed(
   () =>
     !!task.value &&
     !isRunning.value &&
     task.value.status !== "completed" &&
+    task.value.status !== "terminated" &&
     !!selected.value &&
     (selected.value.status === "in_progress" || selected.value.status === "needs_human") &&
     !isDesignAwaiting.value
 );
 const statusText = computed(() => {
-  const s = task.value?.status ?? "";
+  const t = task.value;
+  if (!t) return "";
+  if (t.status === "pending") {
+    if (t.pause_reason === "concurrency") return "等待并发名额";
+    if (t.execution_mode === "scheduled")
+      return t.schedule_enabled ? "等待时间窗口" : "待运行（定时窗口关闭）";
+    return "待运行";
+  }
+  if (t.status === "paused" && t.pause_reason === "waiting_window") return "等待时间窗口";
+  if (t.status === "paused") return "已暂停";
   const map: Record<string, string> = {
     planning: "拆解需求中",
     running: "执行中",
     needs_human: "需要人工介入",
-    paused: "已暂停",
+    terminated: "已终止",
     completed: "已完成",
     failed: "执行失败"
   };
-  return map[s] ?? s;
+  return map[t.status] ?? t.status;
+});
+const executionModeLabel = computed(() => {
+  const map: Record<string, string> = {
+    immediate: "立即执行",
+    later: "稍后执行",
+    scheduled: "定时执行"
+  };
+  return map[task.value?.execution_mode ?? ""] ?? task.value?.execution_mode ?? "";
+});
+const scheduleText = computed(() => {
+  const t = task.value;
+  if (!t || t.execution_mode !== "scheduled") return "";
+  return `每日 ${t.schedule_start}–${t.schedule_end}${t.schedule_enabled ? "" : "（窗口关闭）"}`;
 });
 const phaseBanner = computed(() => {
   const t = task.value;
   if (!t) return { text: "", cls: "" };
   if (t.status === "completed") return { text: "✅ 当前阶段：全部完成", cls: "done" };
+  if (t.status === "terminated") return { text: "⛔ 当前阶段：任务已终止", cls: "human" };
   if (t.status === "failed") return { text: "❌ 当前阶段：执行失败", cls: "human" };
+  if (t.status === "pending") {
+    if (t.pause_reason === "concurrency")
+      return { text: "⏳ 当前阶段：等待并发名额", cls: "global" };
+    if (t.execution_mode === "scheduled")
+      return t.schedule_enabled
+        ? {
+            text: `🕒 当前阶段：等待时间窗口 ${t.schedule_start}–${t.schedule_end}`,
+            cls: "global"
+          }
+        : { text: "⏸ 当前阶段：待运行（定时窗口关闭）", cls: "global" };
+    return { text: "⏸ 当前阶段：待运行", cls: "global" };
+  }
+  if (t.status === "paused" && t.pause_reason === "waiting_window")
+    return {
+      text: `🕒 当前阶段：窗口已结束，等待下一个 ${t.schedule_start}–${t.schedule_end} 窗口`,
+      cls: "global"
+    };
   if (t.status === "paused") return { text: "⏸ 当前阶段：已暂停，可恢复", cls: "human" };
   if (t.task_phase === "plan_approval")
     return { text: "当前阶段：等待人工审批拆解方案", cls: "global" };
@@ -199,7 +264,14 @@ function eventKindLabel(kind: string) {
     design_approved: "设计通过",
     design_rejected: "设计驳回",
     config_updated: "配置更新",
-    plan_accepted: "方案确认"
+    plan_accepted: "方案确认",
+    agent_message: "Agent 对话",
+    tool_call: "工具调用",
+    tool_result: "工具结果",
+    dsh_error: "Coder 错误",
+    dsh_raw: "dsh 原始输出",
+    system_log: "系统日志",
+    requirements_updated: "需求更新"
   };
   const base = kind.includes(":") ? kind.slice(0, kind.indexOf(":")) : kind;
   return map[base] ?? kind;
@@ -219,11 +291,23 @@ async function load() {
   loading.value = true;
   try {
     const d = await getTaskDetail(props.taskId);
+    const liveOnly = (detail.value?.execution_events ?? []).filter((e) => e.id < 0);
     detail.value = d;
+    if (liveOnly.length) {
+      const ids = new Set(d.execution_events.map((e) => e.id));
+      detail.value.execution_events = [
+        ...d.execution_events,
+        ...liveOnly.filter((e) => !ids.has(e.id))
+      ];
+    }
     if (!showConfig.value) {
       configForm.module_max_round = d.task.module_max_round;
       configForm.global_max_round = d.task.global_max_round;
       configForm.manual_review_enabled = d.task.manual_review_enabled;
+      configForm.execution_mode = d.task.execution_mode;
+      configForm.schedule_start = d.task.schedule_start;
+      configForm.schedule_end = d.task.schedule_end;
+      configForm.schedule_enabled = d.task.schedule_enabled;
     }
     ensureSelection();
     await nextTick();
@@ -288,20 +372,57 @@ async function doResume() {
   }
 }
 
-async function doCancel() {
+async function doRun() {
   if (!task.value) return;
-  if (!window.confirm("确认终止当前任务？当前 dsh 会被立即停止；已产生的数据和执行记录都会保留，之后可以恢复。"))
-    return;
   actionBusy.value = true;
   try {
-    await cancelTask(task.value.id);
-    showToast("已发送终止请求", "success");
+    const outcome = await startTask(task.value.id);
+    showToast(outcome.message, outcome.started ? "success" : "error");
     scheduleReload();
   } catch (e) {
     showToast(errorMessage(e), "error");
   } finally {
     actionBusy.value = false;
   }
+}
+
+async function doPause() {
+  if (!task.value) return;
+  actionBusy.value = true;
+  try {
+    await pauseTask(task.value.id);
+    showToast("已发送暂停请求", "success");
+    scheduleReload();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function doTerminate() {
+  if (!task.value) return;
+  if (
+    !window.confirm(
+      "确认终止当前任务？终止后不会再派发新的子任务；已产生的代码、日志和模块快照会保留，但任务不能恢复。"
+    )
+  )
+    return;
+  actionBusy.value = true;
+  try {
+    await terminateTask(task.value.id);
+    showToast("任务已终止", "success");
+    scheduleReload();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+function onRequirementsSaved(updated: TaskMain) {
+  if (detail.value) detail.value.task = updated;
+  scheduleReload();
 }
 
 async function saveConfig() {
@@ -311,7 +432,11 @@ async function saveConfig() {
     await updateTaskConfig(task.value.id, {
       module_max_round: Number(configForm.module_max_round),
       global_max_round: Number(configForm.global_max_round),
-      manual_review_enabled: configForm.manual_review_enabled
+      manual_review_enabled: configForm.manual_review_enabled,
+      execution_mode: configForm.execution_mode,
+      schedule_start: configForm.schedule_start,
+      schedule_end: configForm.schedule_end,
+      schedule_enabled: configForm.schedule_enabled
     });
     showToast("运行中配置已保存", "success");
     await load();
@@ -486,6 +611,17 @@ async function submitGlobalRework() {
   }
 }
 
+async function openConsole() {
+  if (!task.value) return;
+  try {
+    allEvents.value = await listTaskEvents(task.value.id);
+  } catch (e) {
+    allEvents.value = executionEvents.value;
+    showToast(errorMessage(e), "error");
+  }
+  showConsole.value = true;
+}
+
 function applyLiveEvent(event: TaskEvent) {
   if (!detail.value || event.task_id !== detail.value.task.id) return;
   const exists = detail.value.execution_events.some((e) => e.id === event.id);
@@ -555,25 +691,41 @@ onUnmounted(() => {
             <span>Coder：{{ detail?.coders.map((c) => c.name).join("、") || "—" }}</span>
             <span>阶段：{{ task.task_phase === "global_review" ? "全局评审" : task.task_phase === "plan_approval" ? "方案审批" : "模块开发" }}</span>
             <span>状态：{{ statusText }}</span>
+            <span>执行：{{ executionModeLabel }}</span>
+            <span v-if="scheduleText">窗口：{{ scheduleText }}</span>
             <span>人工审核：{{ task.manual_review_enabled ? "开启" : "关闭" }}</span>
-            <span>模块轮次：{{ task.module_max_round }}</span>
-            <span>全局轮次：{{ task.current_global_round }}/{{ task.global_max_round }}</span>
+            <span>轮次：{{ task.current_global_round }}/{{ task.global_max_round }}</span>
           </div>
         </div>
         <div class="flex" style="margin-left: auto">
-          <button class="btn btn-sm" @click="showConfig = !showConfig">
-            ⚙ 运行中配置
-          </button>
+          <button class="btn btn-sm" @click="showConfig = !showConfig">⚙ 配置</button>
           <button
-            v-if="canCancel"
-            class="btn btn-sm btn-danger"
+            v-if="task.status !== 'completed' && task.status !== 'terminated'"
+            class="btn btn-sm"
             :disabled="actionBusy"
-            @click="doCancel"
+            @click="showRequirements = true"
           >
-            终止执行
+            📝 需求
+          </button>
+          <button class="btn btn-sm" :disabled="actionBusy" @click="showChat = true">
+            💬 问答
+          </button>
+          <button v-if="canRun" class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doRun">
+            运行
+          </button>
+          <button v-if="canPause" class="btn btn-sm" :disabled="actionBusy" @click="doPause">
+            暂停
           </button>
           <button v-if="canResume" class="btn btn-sm" :disabled="actionBusy" @click="doResume">
-            恢复调度
+            恢复
+          </button>
+          <button
+            v-if="canTerminate"
+            class="btn btn-sm btn-danger"
+            :disabled="actionBusy"
+            @click="doTerminate"
+          >
+            终止
           </button>
         </div>
         <div class="phase-banner" :class="phaseBanner.cls" style="margin-left: 10px">
@@ -592,10 +744,32 @@ onUnmounted(() => {
             <label>全局评审最大轮次</label>
             <input v-model.number="configForm.global_max_round" type="number" min="1" max="99" />
           </div>
+          <div class="field">
+            <label>执行模式</label>
+            <select v-model="configForm.execution_mode">
+              <option value="immediate">立即执行</option>
+              <option value="later">稍后执行</option>
+              <option value="scheduled">定时执行</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="flex" style="cursor: pointer; padding-top: 20px">
+              <input v-model="configForm.manual_review_enabled" type="checkbox" />
+              人工审核方案与设计
+            </label>
+          </div>
+          <div class="field">
+            <label>定时窗口开始</label>
+            <input v-model="configForm.schedule_start" type="time" />
+          </div>
+          <div class="field">
+            <label>定时窗口结束</label>
+            <input v-model="configForm.schedule_end" type="time" />
+          </div>
           <div class="field" style="justify-content: flex-end">
             <label class="flex" style="cursor: pointer">
-              <input v-model="configForm.manual_review_enabled" type="checkbox" />
-              人工审核方案与模块设计
+              <input v-model="configForm.schedule_enabled" type="checkbox" />
+              启用定时窗口
             </label>
           </div>
           <div class="field" style="justify-content: flex-end">
@@ -801,7 +975,7 @@ onUnmounted(() => {
                 </span>
                 <span class="small muted right">{{ rec.created_at }}</span>
               </div>
-              <div style="white-space: pre-wrap; color: #c2cbdb; font-size: 12.5px">
+              <div style="white-space: pre-wrap; color: var(--text-2); font-size: 12.5px">
                 {{ rec.feedback || "（无补充说明）" }}
               </div>
               <div v-for="(issue, i) in rec.issues" :key="i" class="issue-item">
@@ -862,7 +1036,7 @@ onUnmounted(() => {
                   本子任务验收标准
                   <span class="right small muted">评审拆分原文</span>
                 </div>
-                <div class="body" style="white-space: pre-wrap; color: #c2cbdb; font-size: 12.5px">
+                <div class="body" style="white-space: pre-wrap; color: var(--text-2); font-size: 12.5px">
                   {{ selected.accept_criteria || "（评审未提供）" }}
                 </div>
               </div>
@@ -921,7 +1095,10 @@ onUnmounted(() => {
             </template>
           </div>
 
-          <div v-if="task.status !== 'completed'" class="human-composer">
+          <div
+            v-if="task.status !== 'completed' && task.status !== 'terminated'"
+            class="human-composer"
+          >
             <div class="hc-title">
               人工实时介入
               <span class="small muted">消息会在下一个 Agent 步骤注入；不会清空任何数据</span>
@@ -947,6 +1124,39 @@ onUnmounted(() => {
         </section>
 
         <aside class="wb-col right">
+          <div class="wb-section-title">
+            任务需求
+            <button
+              v-if="task.status !== 'completed' && task.status !== 'terminated'"
+              class="btn btn-sm btn-ghost"
+              style="margin-left: auto"
+              @click="showRequirements = true"
+            >
+              编辑
+            </button>
+          </div>
+          <div class="contract-box">
+            <div class="ch">顶层需求</div>
+            <div class="cb">
+              <pre class="pre-box" style="max-height: 150px">{{ task.top_requirement }}</pre>
+            </div>
+            <div class="ch">项目验收标准</div>
+            <div class="cb">
+              <pre class="pre-box" style="max-height: 120px">{{ task.global_accept_criteria }}</pre>
+            </div>
+          </div>
+
+          <div class="wb-section-title">
+            Agent 会话
+            <span class="count">{{ executionEvents.length }} 条事件</span>
+          </div>
+          <ConversationPanel
+            :events="executionEvents"
+            :reviewer-name="detail?.reviewer?.name ?? '技术总监'"
+            :coder-name="detail?.coders[0]?.name ?? 'Coder'"
+            @open-console="openConsole"
+          />
+
           <div class="wb-section-title">技术栈</div>
           <div class="contract-box">
             <div class="ch" @click="techStackOpen = !techStackOpen">
@@ -994,42 +1204,21 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div class="wb-section-title">
-            实时执行输出
-            <button class="btn btn-sm btn-ghost" style="margin-left: auto" @click="showConsole = true">
-              展开全部
-            </button>
-          </div>
-          <div ref="eventBox" class="event-box">
-            <div v-if="!visibleEvents.length" class="muted small">暂无执行输出</div>
-            <div
-              v-for="ev in visibleEvents"
-              :key="ev.id"
-              class="event-line"
-              :class="eventKindClass(ev.kind)"
-            >
-              <div class="ev-head">
-                <span class="ev-kind">{{ eventKindLabel(ev.kind) }}</span>
-                <span class="ev-time">{{ ev.create_time.slice(11) }}</span>
-                <span v-if="ev.subtask_id" class="ev-sub">#{{ ev.subtask_id }}</span>
+          <details class="system-logs">
+            <summary>系统事件日志（{{ detail?.logs.length ?? 0 }}）</summary>
+            <div ref="logBox" class="log-box">
+              <div v-if="!detail?.logs.length" class="muted">暂无事件</div>
+              <div
+                v-for="log in detail?.logs ?? []"
+                :key="log.id"
+                class="log-line"
+                :class="log.level"
+              >
+                <span class="log-time">{{ log.create_time.slice(11) }}</span>
+                <span class="log-msg">{{ log.message }}</span>
               </div>
-              <pre class="ev-content">{{ ev.content }}</pre>
             </div>
-          </div>
-
-          <div class="wb-section-title">系统事件日志</div>
-          <div ref="logBox" class="log-box">
-            <div v-if="!detail?.logs.length" class="muted">暂无事件</div>
-            <div
-              v-for="log in detail?.logs ?? []"
-              :key="log.id"
-              class="log-line"
-              :class="log.level"
-            >
-              <span class="log-time">{{ log.create_time.slice(11) }}</span>
-              <span class="log-msg">{{ log.message }}</span>
-            </div>
-          </div>
+          </details>
 
           <div class="wb-section-title">任务信息</div>
           <div class="panel" style="padding: 11px">
@@ -1137,17 +1326,36 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <ChatPanel
+      v-if="showChat && task"
+      :task-id="task.id"
+      :task-name="task.task_name"
+      :reviewer-name="detail?.reviewer?.name ?? '技术总监'"
+      @close="showChat = false"
+    />
+
+    <RequirementsModal
+      v-if="showRequirements && task"
+      :task="task"
+      @close="showRequirements = false"
+      @saved="onRequirementsSaved"
+    />
+
     <div v-if="showConsole" class="modal-mask" @click.self="showConsole = false">
       <div class="modal console-modal">
         <div class="modal-head">
-          全量执行输出
-          <span class="small muted" style="margin-left: 10px">{{ executionEvents.length }} 条</span>
+          原始事件 · 全链路
+          <span class="small muted" style="margin-left: 10px">
+            {{ (allEvents.length ? allEvents : executionEvents).length }} 条
+          </span>
           <button class="x" @click="showConsole = false">×</button>
         </div>
         <div class="console-modal-body">
-          <div v-if="!executionEvents.length" class="muted">暂无执行输出</div>
+          <div v-if="!(allEvents.length ? allEvents : executionEvents).length" class="muted">
+            暂无执行输出
+          </div>
           <div
-            v-for="ev in executionEvents"
+            v-for="ev in allEvents.length ? allEvents : executionEvents"
             :key="'all-' + ev.id"
             class="event-line"
             :class="eventKindClass(ev.kind)"

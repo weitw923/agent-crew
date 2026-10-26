@@ -70,7 +70,7 @@ pub struct TaskMain {
     pub global_max_round: i64,
     pub global_contract: String,
     pub task_phase: String, // module_dev / global_review
-    pub status: String,     // planning / running / needs_human / completed / failed
+    pub status: String, // pending / planning / running / needs_human / paused / terminated / completed / failed
     pub work_dir: String,
     pub current_global_round: i64,
     pub global_review_records: Vec<GlobalReviewRecord>,
@@ -90,6 +90,25 @@ pub struct TaskMain {
     /// 人工终止请求标记；恢复调度时清零。
     #[serde(default)]
     pub cancel_requested: bool,
+    /// 执行模式：immediate 立即执行 / later 稍后执行 / scheduled 定时执行。
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+    /// 定时执行窗口（本地时间 HH:MM）。
+    #[serde(default = "default_schedule_start")]
+    pub schedule_start: String,
+    #[serde(default = "default_schedule_end")]
+    pub schedule_end: String,
+    #[serde(default = "default_true")]
+    pub schedule_enabled: bool,
+    /// 人工手动运行定时任务时忽略窗口；自动调度会清零。
+    #[serde(default)]
+    pub schedule_override: bool,
+    /// 已请求启动但受并发上限限制，等待调度器启动。
+    #[serde(default)]
+    pub start_requested: bool,
+    /// 暂停原因：manual / waiting_window / concurrency / terminated。
+    #[serde(default)]
+    pub pause_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +170,15 @@ pub struct TaskEvent {
 
 /// 人工随时输入的消息，pending 状态会在下一个 Agent 步骤注入。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: i64,
+    pub task_id: i64,
+    pub role: String, // user / assistant
+    pub content: String,
+    pub create_time: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HumanMessage {
     pub id: i64,
     pub task_id: i64,
@@ -172,6 +200,8 @@ pub struct TaskDetail {
     pub human_messages: Vec<HumanMessage>,
     #[serde(default)]
     pub pending_plan: Option<PendingPlan>,
+    #[serde(default)]
+    pub chat_messages: Vec<ChatMessage>,
 }
 
 /// 列表页使用的扁平结构：TaskMain 字段 + 展示用派生字段。
@@ -197,6 +227,14 @@ pub struct NewTaskInput {
     pub work_dir: String,
     #[serde(default)]
     pub manual_review_enabled: bool,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+    #[serde(default = "default_schedule_start")]
+    pub schedule_start: String,
+    #[serde(default = "default_schedule_end")]
+    pub schedule_end: String,
+    #[serde(default = "default_true")]
+    pub schedule_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +242,14 @@ pub struct TaskConfigInput {
     pub module_max_round: i64,
     pub global_max_round: i64,
     pub manual_review_enabled: bool,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+    #[serde(default = "default_schedule_start")]
+    pub schedule_start: String,
+    #[serde(default = "default_schedule_end")]
+    pub schedule_end: String,
+    #[serde(default = "default_true")]
+    pub schedule_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +259,28 @@ pub struct AppSettings {
     pub dsh_timeout_sec: String,
     pub dsh_bin: String,
     pub dsh_profile: String,
+    /// 任务数据、数据库、日志与模块快照的存储根目录。
+    #[serde(default)]
+    pub storage_root: String,
+    /// 是否把运行日志/执行事件持久化到数据库；关闭时只在页面实时展示。
+    #[serde(default = "default_true")]
+    pub log_persistence: bool,
+    /// 新建任务默认执行模式。
+    #[serde(default = "default_execution_mode")]
+    pub default_execution_mode: String,
+    #[serde(default = "default_module_round")]
+    pub default_module_max_round: String,
+    #[serde(default = "default_global_round")]
+    pub default_global_max_round: String,
+    /// 同时运行的任务数上限。
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_tasks: String,
+    /// 全局定时任务开关。
+    #[serde(default = "default_true")]
+    pub scheduled_enabled: bool,
+    /// LLM 每分钟请求上限；0 表示不限。
+    #[serde(default = "default_rate_limit")]
+    pub llm_rate_limit_per_min: String,
 }
 
 impl Default for AppSettings {
@@ -226,6 +294,45 @@ impl Default for AppSettings {
             dsh_timeout_sec: "1800".to_string(),
             dsh_bin: "dsh".to_string(),
             dsh_profile: "headless".to_string(),
+            storage_root: String::new(),
+            log_persistence: true,
+            default_execution_mode: "later".to_string(),
+            default_module_max_round: "3".to_string(),
+            default_global_max_round: "2".to_string(),
+            max_concurrent_tasks: "1".to_string(),
+            scheduled_enabled: true,
+            llm_rate_limit_per_min: "0".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartOutcome {
+    pub started: bool,
+    pub message: String,
+}
+
+pub fn default_execution_mode() -> String {
+    "later".to_string()
+}
+pub fn default_schedule_start() -> String {
+    "01:00".to_string()
+}
+pub fn default_schedule_end() -> String {
+    "06:00".to_string()
+}
+pub fn default_true() -> bool {
+    true
+}
+fn default_module_round() -> String {
+    "3".to_string()
+}
+fn default_global_round() -> String {
+    "2".to_string()
+}
+fn default_max_concurrent() -> String {
+    "1".to_string()
+}
+fn default_rate_limit() -> String {
+    "0".to_string()
 }
