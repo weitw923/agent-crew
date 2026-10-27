@@ -116,6 +116,7 @@ pub fn run() {
             commands::list_task_events,
             commands::delete_task,
             commands::human_force_pass,
+            commands::extend_subtask_rounds,
             commands::human_reject,
             commands::global_human_force_pass,
             commands::global_human_rework,

@@ -31,6 +31,16 @@ export const listTaskEvents = (taskId: number) =>
 export const deleteTask = (taskId: number) => invoke<void>("delete_task", { taskId });
 export const humanForcePass = (taskId: number, subtaskId: number) =>
   invoke<void>("human_force_pass", { taskId, subtaskId });
+export const extendSubtaskRounds = (
+  taskId: number,
+  subtaskId: number,
+  extraRounds: number
+) =>
+  invoke<void>("extend_subtask_rounds", {
+    taskId,
+    subtaskId,
+    extraRounds
+  });
 export const humanReject = (taskId: number, subtaskId: number, feedback: string) =>
   invoke<void>("human_reject", { taskId, subtaskId, feedback });
 export const globalHumanForcePass = (taskId: number) =>

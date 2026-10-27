@@ -2499,6 +2499,84 @@ pub fn clear_chat_messages(app: &AppHandle, task_id: i64) -> Result<(), String> 
     Ok(())
 }
 
+/// 人工追加轮次：在保留历史记录的前提下，从当前失败阶段继续自动执行。
+pub fn extend_subtask_rounds(
+    app: &AppHandle,
+    task_id: i64,
+    subtask_id: i64,
+    extra_rounds: i64,
+) -> Result<(), String> {
+    if !(1..=20).contains(&extra_rounds) {
+        return Err("追加轮次必须是 1–20 的整数".into());
+    }
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    let mut sub = db::get_subtask(&conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
+    if sub.task_id != task_id {
+        return Err("子任务不属于该任务".into());
+    }
+    if task.status == "completed" || sub.status == "completed" {
+        return Err("任务或子任务已完成，无法追加轮次".into());
+    }
+    if task.status == "terminated" {
+        return Err("任务已终止，请先点击「继续任务」恢复".into());
+    }
+    let stage = sub.current_stage.as_str();
+    let next_stage = match stage {
+        "code_review" => "coding",
+        "summary_review" => "summary_generation",
+        other => {
+            return Err(format!(
+                "当前阶段（{other}）没有待重试的评审结果，无法追加轮次"
+            ))
+        }
+    };
+    let old_max = sub.max_round;
+    sub.current_round += 1;
+    sub.max_round = old_max + extra_rounds;
+    sub.current_stage = next_stage.into();
+    sub.status = "in_progress".into();
+    task.status = "running".into();
+    task.pause_reason.clear();
+    task.cancel_requested = false;
+    db::save_subtask(&conn, &sub)?;
+    db::save_task(&conn, &task)?;
+    record_event(
+        Some(app),
+        &conn,
+        task_id,
+        Some(sub.id),
+        "human_extend_rounds",
+        &format!(
+            "人工追加 {} 轮：子任务 #{} 从第 {}/{} 轮继续自动执行",
+            extra_rounds, sub.sort_index, sub.current_round, sub.max_round
+        ),
+    );
+    log(
+        Some(app),
+        &conn,
+        task_id,
+        "warn",
+        &format!(
+            "人工追加 {} 轮：子任务 #{}「{}」当前第 {}/{} 轮，继续自动执行",
+            extra_rounds, sub.sort_index, sub.subtask_name, sub.current_round, sub.max_round
+        ),
+    );
+    drop(conn);
+    if let Err(e) = spawn_task(app.clone(), task_id) {
+        if let Ok(conn) = db::open(&db_path) {
+            if let Ok(Some(mut failed)) = db::get_task(&conn, task_id) {
+                failed.status = "failed".into();
+                let _ = db::save_task(&conn, &failed);
+            }
+        }
+        return Err(format!("追加轮次后启动调度失败：{e}"));
+    }
+    Ok(())
+}
+
 pub fn human_force_pass(
     app: Option<&AppHandle>,
     task_id: i64,
@@ -2514,6 +2592,9 @@ pub fn human_force_pass(
     }
     if task.status == "completed" {
         return Err("任务已完成".into());
+    }
+    if task.status == "terminated" {
+        return Err("任务已终止，请先点击「继续任务」恢复后再人工处理".into());
     }
     match sub.current_stage.as_str() {
         "code_review" => {
@@ -2537,6 +2618,9 @@ pub fn human_force_pass(
                 .last()
                 .map(|r| r.summary_content.clone())
                 .unwrap_or_default();
+            if summary.trim().is_empty() {
+                return Err("当前摘要内容为空，不能强制通过；请驳回并让 Coder 重新生成".into());
+            }
             update_last_record(&mut sub, "人工强制通过摘要校验", "pass");
             let storage_root = handle.state::<AppState>().storage_root()?;
             let path = storage::persist_summary(&storage_root, task.id, &sub, &summary)?;
@@ -2592,6 +2676,9 @@ pub fn human_reject(
     if task.status == "completed" || sub.status == "completed" {
         return Err("任务或子任务已完成，无法驳回".into());
     }
+    if task.status == "terminated" {
+        return Err("任务已终止，请先点击「继续任务」恢复后再人工处理".into());
+    }
 
     let stage_before = sub.current_stage.clone();
     let has_pending = sub
@@ -2615,6 +2702,10 @@ pub fn human_reject(
     }
 
     sub.current_round += 1;
+    if sub.max_round < sub.current_round {
+        // 人工驳回应当真正获得一轮新的执行预算，而不是立刻再次判定超限。
+        sub.max_round = sub.current_round;
+    }
     sub.current_stage = if stage_before == "summary_review" {
         "summary_generation".into()
     } else {
@@ -2780,22 +2871,63 @@ pub fn resume_task(app: Option<&AppHandle>, task_id: i64) -> Result<(), String> 
     let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
     let db_path = handle.state::<AppState>().db_path()?;
     let conn = db::open(&db_path)?;
-    let task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     if task.status == "completed" {
         return Err("任务已完成，无需恢复".into());
     }
-    if task.status == "terminated" {
-        return Err("任务已终止，无法恢复".into());
+
+    let was_terminated = task.status == "terminated";
+    if was_terminated {
+        // 终止不再是不可逆操作：继续时保留全部模块/轮次，只清除终止标记。
+        task.status = "paused".into();
+        task.pause_reason.clear();
+        task.cancel_requested = false;
+        task.start_requested = false;
+        task.schedule_override = false;
+        db::save_task(&conn, &task)?;
+        log(
+            Some(handle),
+            &conn,
+            task_id,
+            "info",
+            "继续已终止任务：从当前持久化进度恢复，不重跑已完成模块",
+        );
+        emit_update(Some(handle), task_id);
     }
+
+    let subtasks = db::list_subtasks(&conn, task_id)?;
     if task.task_phase == "plan_approval" {
-        return Err("方案正在等待人工审批，请先点击「同意方案」或「驳回方案」".into());
+        task.status = "needs_human".into();
+        task.pause_reason.clear();
+        db::save_task(&conn, &task)?;
+        emit_update(Some(handle), task_id);
+        return Ok(());
     }
-    if db::list_subtasks(&conn, task_id)?
+    if subtasks
         .iter()
         .any(|s| s.current_stage == "design_approval")
     {
-        return Err("模块设计正在等待人工审批，请先审批设计文档".into());
+        task.status = "needs_human".into();
+        task.pause_reason.clear();
+        db::save_task(&conn, &task)?;
+        emit_update(Some(handle), task_id);
+        return Ok(());
     }
+    if subtasks.iter().any(|s| s.status == "needs_human") {
+        task.status = "needs_human".into();
+        task.pause_reason.clear();
+        db::save_task(&conn, &task)?;
+        log(
+            Some(handle),
+            &conn,
+            task_id,
+            "warn",
+            "任务已继续，但仍有模块等待人工介入；请在工作台处理当前模块",
+        );
+        emit_update(Some(handle), task_id);
+        return Ok(());
+    }
+
     drop(conn);
     let outcome = start_task(handle, task_id)?;
     if !outcome.started {
@@ -2871,7 +3003,7 @@ pub fn terminate_task(app: &AppHandle, task_id: i64) -> Result<(), String> {
         &conn,
         task_id,
         "warn",
-        "任务已人工终止：不会再派发新的子任务，历史数据与模块快照保留",
+        "任务已人工终止：不会再派发新的子任务；历史数据与模块快照保留，可随时点击「继续任务」恢复",
     );
     emit_update(Some(app), task_id);
     Ok(())

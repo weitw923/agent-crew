@@ -176,6 +176,17 @@ pub fn human_force_pass(app: AppHandle, task_id: i64, subtask_id: i64) -> Result
 }
 
 #[tauri::command]
+pub fn extend_subtask_rounds(
+    app: AppHandle,
+    task_id: i64,
+    subtask_id: i64,
+    extra_rounds: i64,
+) -> Result<(), String> {
+    ensure_not_running(&app, task_id)?;
+    orchestrator::extend_subtask_rounds(&app, task_id, subtask_id, extra_rounds)
+}
+
+#[tauri::command]
 pub fn human_reject(
     app: AppHandle,
     task_id: i64,

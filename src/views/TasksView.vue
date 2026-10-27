@@ -66,7 +66,10 @@ async function runTask(task: TaskSummary) {
       showToast(outcome.message, outcome.started ? "success" : "error");
     } else {
       await resumeTask(task.id);
-      showToast("已请求恢复调度", "success");
+      showToast(
+        task.status === "terminated" ? "任务已继续，从当前进度恢复" : "已请求恢复调度",
+        "success"
+      );
     }
     await load();
   } catch (e) {
@@ -156,11 +159,29 @@ onUnmounted(() => unlisten?.());
               打开详情
             </button>
             <button
-              v-if="task.status === 'pending' || task.status === 'paused' || task.status === 'failed'"
+              v-if="
+                task.status === 'pending' ||
+                task.status === 'paused' ||
+                task.status === 'failed' ||
+                task.status === 'terminated'
+              "
               class="btn btn-sm"
               @click="runTask(task)"
             >
-              {{ task.status === "pending" ? "运行" : "恢复" }}
+              {{
+                task.status === "pending"
+                  ? "运行"
+                  : task.status === "terminated"
+                    ? "继续"
+                    : "恢复"
+              }}
+            </button>
+            <button
+              v-if="task.status === 'needs_human'"
+              class="btn btn-sm btn-primary"
+              @click="emit('open-task', task.id)"
+            >
+              处理人工介入
             </button>
             <button class="btn btn-sm btn-danger right" @click="remove(task)">删除任务</button>
           </div>

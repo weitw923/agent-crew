@@ -28,6 +28,7 @@ const CONVERSATION_KINDS = new Set([
   "summary_file",
   "human_message",
   "human_message_delivered",
+  "human_extend_rounds",
   "requirements_updated",
   "config_updated",
   "tool_call",
@@ -69,7 +70,11 @@ function roleOf(ev: TaskEvent) {
     return { name: props.coderName || "Coder", cls: "coder", label: "Coder" };
   if (base === "tool_call" || base === "tool_result")
     return { name: props.coderName || "Coder", cls: "coder", label: "工具" };
-  if (ev.kind.startsWith("human_message") || base === "requirements_updated")
+  if (
+    ev.kind.startsWith("human_message") ||
+    base === "requirements_updated" ||
+    base === "human_extend_rounds"
+  )
     return { name: "你", cls: "human", label: "人工" };
   if (base === "system_log") return { name: "系统", cls: "system", label: "系统" };
   return { name: "系统", cls: "system", label: "事件" };
@@ -90,6 +95,7 @@ function labelOf(ev: TaskEvent) {
     summary_file: "模块摘要",
     human_message: "人工消息",
     human_message_delivered: "人工消息已注入",
+    human_extend_rounds: "人工追加轮次",
     requirements_updated: "需求已更新",
     config_updated: "配置更新",
     tool_call: "工具调用",

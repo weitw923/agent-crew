@@ -9,6 +9,7 @@ import type { ExecutionMode, Subtask, TaskDetail, TaskEvent, TaskMain } from "..
 import {
   approveDesign,
   approvePlan,
+  extendSubtaskRounds,
   getTaskDetail,
   listTaskEvents,
   globalHumanForcePass,
@@ -60,6 +61,7 @@ const configForm = reactive({
 
 const showChat = ref(false);
 const showRequirements = ref(false);
+const extraRounds = ref(2);
 
 const humanMessage = ref("");
 const contractOpen = ref(true);
@@ -130,16 +132,46 @@ const canTerminate = computed(
     task.value.status !== "completed" &&
     task.value.status !== "terminated"
 );
+const canContinue = computed(() => !!task.value && task.value.status === "terminated");
+const pendingHumanSubtask = computed(
+  () => subtasks.value.find((s) => s.status === "needs_human") ?? null
+);
+const humanTarget = computed(() => {
+  if (selected.value?.status === "needs_human") return selected.value;
+  return pendingHumanSubtask.value;
+});
 const canHuman = computed(
   () =>
     !!task.value &&
     !isRunning.value &&
     task.value.status !== "completed" &&
     task.value.status !== "terminated" &&
-    !!selected.value &&
-    (selected.value.status === "in_progress" || selected.value.status === "needs_human") &&
+    !!humanTarget.value &&
     !isDesignAwaiting.value
 );
+const humanStageLabel = computed(() => {
+  const map: Record<string, string> = {
+    code_review: "代码评审",
+    summary_review: "摘要校验"
+  };
+  return map[humanTarget.value?.current_stage ?? ""] ?? humanTarget.value?.current_stage ?? "";
+});
+const humanActionLabel = computed(() => {
+  if (humanTarget.value?.current_stage === "code_review") return "强制通过代码评审，继续生成摘要";
+  if (humanTarget.value?.current_stage === "summary_review") return "强制通过摘要，完成模块";
+  return "人工强制通过";
+});
+const humanReason = computed(() => {
+  const target = humanTarget.value;
+  if (!target) return "";
+  const record = [...target.iteration_records]
+    .reverse()
+    .find((r) => r.review_feedback.trim() || r.review_decision);
+  return (
+    record?.review_feedback?.trim() ||
+    "该模块已达到当前轮次上限，需要人工判断是否通过、追加轮次或驳回修改。"
+  );
+});
 const statusText = computed(() => {
   const t = task.value;
   if (!t) return "";
@@ -178,7 +210,8 @@ const phaseBanner = computed(() => {
   const t = task.value;
   if (!t) return { text: "", cls: "" };
   if (t.status === "completed") return { text: "✅ 当前阶段：全部完成", cls: "done" };
-  if (t.status === "terminated") return { text: "⛔ 当前阶段：任务已终止", cls: "human" };
+  if (t.status === "terminated")
+    return { text: "⛔ 当前阶段：任务已终止，可继续任务", cls: "human" };
   if (t.status === "failed") return { text: "❌ 当前阶段：执行失败", cls: "human" };
   if (t.status === "pending") {
     if (t.pause_reason === "concurrency")
@@ -271,7 +304,8 @@ function eventKindLabel(kind: string) {
     dsh_error: "Coder 错误",
     dsh_raw: "dsh 原始输出",
     system_log: "系统日志",
-    requirements_updated: "需求更新"
+    requirements_updated: "需求更新",
+    human_extend_rounds: "人工追加轮次"
   };
   const base = kind.includes(":") ? kind.slice(0, kind.indexOf(":")) : kind;
   return map[base] ?? kind;
@@ -329,8 +363,8 @@ function ensureSelection() {
   if (selectedSubtaskId.value && list.some((s) => s.id === selectedSubtaskId.value)) return;
   const current =
     list.find((s) => s.current_stage === "design_approval") ??
-    list.find((s) => s.status === "in_progress") ??
     list.find((s) => s.status === "needs_human") ??
+    list.find((s) => s.status === "in_progress") ??
     list[0];
   selectedSubtaskId.value = current?.id ?? null;
 }
@@ -363,7 +397,10 @@ async function doResume() {
   actionBusy.value = true;
   try {
     await resumeTask(task.value.id);
-    showToast("已请求恢复调度", "success");
+    showToast(
+      task.value.status === "terminated" ? "任务已继续，从当前进度恢复" : "已请求恢复调度",
+      "success"
+    );
     scheduleReload();
   } catch (e) {
     showToast(errorMessage(e), "error");
@@ -404,7 +441,7 @@ async function doTerminate() {
   if (!task.value) return;
   if (
     !window.confirm(
-      "确认终止当前任务？终止后不会再派发新的子任务；已产生的代码、日志和模块快照会保留，但任务不能恢复。"
+      "确认终止当前任务？终止后不会再派发新的子任务；已产生的代码、日志和模块快照会保留，之后可以点击「继续任务」恢复。"
     )
   )
     return;
@@ -529,12 +566,37 @@ async function sendMessage() {
 }
 
 async function forcePass() {
-  if (!task.value || !selected.value) return;
-  if (!window.confirm(`确认人工强制通过子任务「${selected.value.subtask_name}」？`)) return;
+  if (!task.value || !humanTarget.value) return;
+  const target = humanTarget.value;
+  const action = humanActionLabel.value;
+  if (!window.confirm(`确认对子任务「${target.subtask_name}」执行：${action}？`)) return;
   actionBusy.value = true;
   try {
-    await humanForcePass(task.value.id, selected.value.id);
-    showToast("已人工强制通过，调度继续", "success");
+    await humanForcePass(task.value.id, target.id);
+    showToast("已人工通过，调度继续", "success");
+    scheduleReload();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function extendRounds() {
+  if (!task.value || !humanTarget.value) return;
+  const target = humanTarget.value;
+  const extra = Number(extraRounds.value);
+  if (!Number.isInteger(extra) || extra < 1) return showToast("请选择追加轮次", "error");
+  if (
+    !window.confirm(
+      `确认给子任务「${target.subtask_name}」追加 ${extra} 轮？将从当前失败阶段继续自动执行。`
+    )
+  )
+    return;
+  actionBusy.value = true;
+  try {
+    await extendSubtaskRounds(task.value.id, target.id, extra);
+    showToast(`已追加 ${extra} 轮，任务继续自动执行`, "success");
     scheduleReload();
   } catch (e) {
     showToast(errorMessage(e), "error");
@@ -544,6 +606,7 @@ async function forcePass() {
 }
 
 function openRejectModal() {
+  if (!humanTarget.value) return;
   rejectText.value = "";
   showReject.value = true;
 }
@@ -557,11 +620,11 @@ function openDesignReject() {
 }
 
 async function submitReject() {
-  if (!task.value || !selected.value) return;
+  if (!task.value || !humanTarget.value) return;
   if (!rejectText.value.trim()) return showToast("请填写人工修改意见", "error");
   actionBusy.value = true;
   try {
-    await humanReject(task.value.id, selected.value.id, rejectText.value.trim());
+    await humanReject(task.value.id, humanTarget.value.id, rejectText.value.trim());
     showReject.value = false;
     showToast("已人工驳回并继续派发 Coder", "success");
     scheduleReload();
@@ -716,8 +779,21 @@ onUnmounted(() => {
           <button v-if="canPause" class="btn btn-sm" :disabled="actionBusy" @click="doPause">
             暂停
           </button>
-          <button v-if="canResume" class="btn btn-sm" :disabled="actionBusy" @click="doResume">
+          <button
+            v-if="canResume && !humanTarget"
+            class="btn btn-sm"
+            :disabled="actionBusy"
+            @click="doResume"
+          >
             恢复
+          </button>
+          <button
+            v-if="canContinue"
+            class="btn btn-sm btn-primary"
+            :disabled="actionBusy"
+            @click="doResume"
+          >
+            继续任务
           </button>
           <button
             v-if="canTerminate"
@@ -847,7 +923,27 @@ onUnmounted(() => {
         <section class="wb-col">
           <!-- 操作台固定在中栏顶部，避免长内容把审批/兜底按钮顶出视野 -->
           <div class="action-dock">
-            <template v-if="isPlanApproval">
+            <template v-if="task.status === 'terminated'">
+              <div class="human-panel terminated-panel">
+                <div class="hp-head">
+                  <span class="badge badge-red">任务已终止</span>
+                  <b>可以继续当前任务</b>
+                  <span v-if="pendingHumanSubtask" class="hp-round">
+                    继续后仍需处理模块 #{{ pendingHumanSubtask.sort_index }}
+                  </span>
+                </div>
+                <div class="hp-text">
+                  终止不会删除任何数据：已完成模块不会重跑，当前模块轮次、diff、评审意见和日志都会保留。
+                  点击「继续任务」从当前持久化进度恢复。
+                </div>
+                <div class="hp-actions">
+                  <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doResume">
+                    继续任务
+                  </button>
+                </div>
+              </div>
+            </template>
+            <template v-else-if="isPlanApproval">
               <div class="human-bar">
                 <div class="tip">只有你同意方案后，Coder 才会开始工作。</div>
                 <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doApprovePlan">
@@ -880,28 +976,71 @@ onUnmounted(() => {
                 </button>
               </div>
             </template>
-            <template v-else-if="!isPlanApproval">
-              <div class="human-bar">
-                <div class="tip">
-                  人工兜底：仅在调度未运行时可用；终止后数据保留，可恢复。
+            <template v-else-if="humanTarget">
+              <div class="human-panel intervention-panel">
+                <div class="hp-head">
+                  <span class="badge badge-red">需要人工介入</span>
+                  <b>#{{ humanTarget.sort_index }} {{ humanTarget.subtask_name }}</b>
+                  <span class="hp-round">
+                    第 {{ humanTarget.current_round }}/{{ humanTarget.max_round }} 轮 ·
+                    {{ humanStageLabel }}
+                  </span>
                 </div>
-                <button
-                  class="btn btn-sm btn-primary"
-                  :disabled="!canHuman || actionBusy"
-                  @click="forcePass"
-                >
-                  人工强制标记通过
-                </button>
-                <button
-                  class="btn btn-sm btn-danger"
-                  :disabled="!canHuman || actionBusy"
-                  @click="openRejectModal"
-                >
-                  人工驳回
-                </button>
+                <div class="hp-reason">
+                  <div class="hp-label">最近评审意见</div>
+                  <div class="hp-reason-text">{{ humanReason }}</div>
+                </div>
+                <div class="hp-actions">
+                  <button
+                    class="btn btn-sm btn-primary"
+                    :disabled="!canHuman || actionBusy"
+                    @click="forcePass"
+                  >
+                    {{ humanActionLabel }}
+                  </button>
+                  <button
+                    class="btn btn-sm btn-danger"
+                    :disabled="!canHuman || actionBusy"
+                    @click="openRejectModal"
+                  >
+                    驳回并重做
+                  </button>
+                  <span class="hp-extend">
+                    <select v-model.number="extraRounds" aria-label="追加轮次">
+                      <option :value="1">追加 1 轮</option>
+                      <option :value="2">追加 2 轮</option>
+                      <option :value="3">追加 3 轮</option>
+                      <option :value="5">追加 5 轮</option>
+                    </select>
+                    <button
+                      class="btn btn-sm"
+                      :disabled="!canHuman || actionBusy"
+                      @click="extendRounds"
+                    >
+                      追加轮次继续
+                    </button>
+                  </span>
+                </div>
+                <div class="hp-hint">
+                  人工通过会直接跳过当前评审；追加轮次会保留全部历史记录，并从失败阶段继续自动执行。
+                </div>
               </div>
             </template>
-          </div>
+            <template v-else-if="task.status === 'needs_human'">
+              <div class="human-panel">
+                <div class="hp-head"><span class="badge badge-red">需要人工介入</span></div>
+                <div class="hp-text">
+                  当前任务等待人工处理；请检查左侧模块或全局评审区域。
+                </div>
+              </div>
+            </template>
+            <template v-else-if="!isRunning">
+              <div class="human-panel subtle-panel">
+                <div class="hp-text">
+                  当前没有待人工处理的评审结果。可以点击顶部「运行 / 恢复 / 继续任务」。
+                </div>
+              </div>
+            </template>          </div>
 
           <div v-if="isPlanApproval" class="global-view">
             <div class="current-head">
@@ -1242,7 +1381,7 @@ onUnmounted(() => {
     <div v-if="showReject" class="modal-mask" @click.self="showReject = false">
       <div class="modal narrow">
         <div class="modal-head">
-          人工驳回 · 输入修改意见
+          人工驳回 · {{ humanTarget?.subtask_name ?? "当前模块" }}
           <button class="x" @click="showReject = false">×</button>
         </div>
         <div class="modal-body">
