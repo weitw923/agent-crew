@@ -98,6 +98,14 @@ function toggleRequirement(id: number) {
     </div>
 
     <div class="iteration-list-body">
+      <div class="task-info-bar">
+        <div class="kv"><span>工作目录</span><span class="mono">{{ task.work_dir }}</span></div>
+        <div class="kv"><span>评审 Agent</span><span>{{ task.reviewer_agent_id ? "已绑定" : "—" }}</span></div>
+        <div class="kv"><span>人工审核</span><span>{{ task.manual_review_enabled ? "开启" : "关闭" }}</span></div>
+        <div class="kv"><span>轮次上限</span><span>模块 {{ task.module_max_round }} / 全局 {{ task.global_max_round }}</span></div>
+        <div class="kv"><span>执行模式</span><span>{{ task.execution_mode === "scheduled" ? `定时 ${task.schedule_start}–${task.schedule_end}` : task.execution_mode === "immediate" ? "立即执行" : "稍后执行" }}</span></div>
+      </div>
+
       <div class="iteration-list-tip">
         每次追加需求都会生成一个新的迭代版本：默认小版本 +1（dev-1.1）；单次需求拆出超过 5 个子任务时自动升大版本（dev-2.0）。
         进入某个迭代可以查看该版本范围内的子任务、评审对话与日志。

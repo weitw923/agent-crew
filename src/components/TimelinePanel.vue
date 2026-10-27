@@ -272,7 +272,8 @@ defineExpose({ scrollToBottom });
 
     <div ref="box" class="timeline-box">
       <div v-if="!timeline.length" class="muted small conv-empty">
-        该迭代还没有对话记录。评审与 Coder 的关键交互、模块设计、评审结论都会按时间出现在这里。
+        该迭代还没有对话记录。评审与 Coder 的关键交互、模块设计、评审结论都会按时间出现在这里。<br />
+        如果该迭代创建时未开启「日志持久化」，历史对话不会保存，需要重新开启后才能记录。
       </div>
 
       <template v-for="(ev, idx) in timeline" :key="ev.id">

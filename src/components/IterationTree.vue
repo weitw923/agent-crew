@@ -16,6 +16,7 @@ const emit = defineEmits<{
   (e: "select-subtask", id: number): void;
   (e: "view", subtask: Subtask): void;
   (e: "design", subtask: Subtask): void;
+  (e: "history", subtask: Subtask): void;
 }>();
 
 /** 默认展开当前迭代，其它迭代折叠；版本倒序。 */
@@ -156,6 +157,18 @@ function canDesign(sub: Subtask) {
                 @click.stop="emit('design', sub)"
               >
                 设计
+              </button>
+              <button
+                class="link-btn"
+                :disabled="!sub.iteration_records.length"
+                :title="
+                  sub.iteration_records.length
+                    ? '在右侧查看该模块每一轮评审意见与 diff'
+                    : '该模块还没有轮次记录'
+                "
+                @click.stop="emit('history', sub)"
+              >
+                历史
               </button>
             </div>
           </article>

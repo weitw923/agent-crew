@@ -366,21 +366,57 @@ function onPreview(payload: PreviewPayload) {
 function closePreview() {
   preview.value = null;
 }
-function selectSubtask(id: number) {
+/** 左栏可能点击到其它迭代下的子任务：自动切到该迭代再选中。 */
+async function selectSubtask(id: number) {
+  const sub = detail.value?.subtasks.find((s) => s.id === id);
+  if (sub?.iteration_id && sub.iteration_id !== activeIterationId.value) {
+    await openIteration(sub.iteration_id);
+  }
   selectedSubtaskId.value = id;
 }
-function viewSubtask(sub: Subtask) {
-  selectedSubtaskId.value = sub.id;
+async function viewSubtask(sub: Subtask) {
+  await selectSubtask(sub.id);
   focusSubtaskId.value = sub.id;
   showTools.value = false;
 }
-function openDesign(sub: Subtask) {
-  selectedSubtaskId.value = sub.id;
+async function openDesign(sub: Subtask) {
+  await selectSubtask(sub.id);
   preview.value = {
     kind: "design",
     title: "模块设计方案",
     content: sub.design_content || "该模块还没有设计文档。",
     source: `#${sub.sort_index} ${sub.subtask_name} · 第 ${sub.current_round} 轮`,
+    time: currentIteration.value?.version
+  };
+}
+/** 把某个模块的每一轮归档渲染成可读文本，在右侧预览。 */
+function openHistory(sub: Subtask) {
+  void selectSubtask(sub.id);
+  const typeLabel: Record<string, string> = {
+    code_review: "代码评审",
+    summary_review: "摘要校验",
+    human_reject: "人工驳回",
+    global_rework: "全局返工"
+  };
+  const blocks = sub.iteration_records.map((rec, idx) => {
+    const decision =
+      rec.review_decision === "pass" ? "✅ 通过" : rec.review_decision === "reject" ? "❌ 不通过" : "—";
+    const lines = [
+      `## 第 ${rec.round || idx + 1} 轮 · ${typeLabel[rec.type] ?? rec.type} · ${decision}`,
+      `时间：${rec.created_at || "—"}`
+    ];
+    if (rec.review_feedback) lines.push("", "评审意见：", rec.review_feedback);
+    if (rec.summary_content) lines.push("", "摘要：", rec.summary_content);
+    if (rec.diff) lines.push("", "本轮 diff：", "```diff", rec.diff, "```");
+    return lines.join("\n");
+  });
+  preview.value = {
+    kind: "review",
+    title: "模块轮次历史",
+    content: blocks.length
+      ? blocks.join("\n\n---\n\n")
+      : "该模块还没有归档的轮次记录。",
+    source: `#${sub.sort_index} ${sub.subtask_name} · 共 ${sub.iteration_records.length} 轮`,
     time: currentIteration.value?.version
   };
 }
@@ -941,6 +977,7 @@ onUnmounted(() => {
           @select-subtask="selectSubtask"
           @view="viewSubtask"
           @design="openDesign"
+          @history="openHistory"
         />
 
         <section class="wb-col">
@@ -1093,7 +1130,11 @@ onUnmounted(() => {
           </div>
 
           <div
-            v-if="task.status !== 'completed' && task.status !== 'terminated'"
+            v-if="
+              isLatestIteration &&
+              task.status !== 'completed' &&
+              task.status !== 'terminated'
+            "
             class="human-composer"
           >
             <div class="hc-title">

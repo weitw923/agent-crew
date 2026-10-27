@@ -52,6 +52,20 @@ async function runScene() {
     await new Promise((r) => setTimeout(r, 400));
     return;
   }
+  if (scene === "history") {
+    // 展开历史迭代 dev-1.0，再点其中带轮次记录的模块「历史」
+    const nodes = Array.from(document.querySelectorAll<HTMLElement>(".iteration-node"));
+    const node = nodes.find((n) => (n.textContent ?? "").includes("dev-1.0"));
+    clickByText(".iteration-node-head", "dev-1.0");
+    await new Promise((r) => setTimeout(r, 300));
+    void node;
+    const btn = Array.from(
+      node?.querySelectorAll<HTMLElement>(".tree-subtask-actions .link-btn") ?? []
+    ).find((b) => (b.textContent ?? "").includes("历史") && !b.hasAttribute("disabled"));
+    btn?.click();
+    await new Promise((r) => setTimeout(r, 700));
+    return;
+  }
   if (scene === "tools") {
     clickByText(".conv-toolbar .chip", "工具调用");
     await new Promise((r) => setTimeout(r, 400));
