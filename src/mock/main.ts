@@ -42,6 +42,10 @@ async function runScene() {
   clickByText(".iteration-card .btn", "进入迭代");
   await new Promise((r) => setTimeout(r, 800));
   if (scene === "workbench") return;
+  if (scene === "completed") {
+    // 已完成任务的「追加需求，继续迭代」固定面板
+    return;
+  }
   if (scene === "design") {
     clickByText(".tree-subtask-actions .link-btn", "设计");
     await new Promise((r) => setTimeout(r, 400));

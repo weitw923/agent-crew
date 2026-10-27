@@ -86,6 +86,129 @@ const allEvents = ref<TaskEvent[]>([]);
 const showConsole = ref(false);
 const logBox = ref<HTMLElement | null>(null);
 
+/* ---------------- 三栏宽度：可拖动 + 本地记忆 ---------------- */
+const LEFT_DEFAULT = 330;
+const RIGHT_DEFAULT = 400;
+const LEFT_MIN = 240;
+const LEFT_MAX = 560;
+const RIGHT_MIN = 280;
+const RIGHT_MAX = 780;
+/** 中栏（对话）最小宽度，拖到极限时优先保证它。 */
+const MID_MIN = 380;
+const RESIZER_TOTAL = 12;
+const LAYOUT_KEY = "agentcrew-wb-layout";
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), Math.max(min, max));
+}
+
+const columnsRef = ref<HTMLElement | null>(null);
+const leftWidth = ref(LEFT_DEFAULT);
+const rightWidth = ref(RIGHT_DEFAULT);
+const columnsStyle = computed(() => ({
+  "--wb-left-w": `${leftWidth.value}px`,
+  "--wb-right-w": `${rightWidth.value}px`
+}));
+
+function columnsTotal() {
+  return columnsRef.value?.clientWidth ?? 0;
+}
+
+/** 容器变窄时按中栏最小宽度反向压缩左右栏，避免整体横向溢出。 */
+function clampWidths() {
+  const total = columnsTotal();
+  if (!total) return;
+  const room = total - MID_MIN - RESIZER_TOTAL;
+  if (leftWidth.value + rightWidth.value > room) {
+    const overflow = leftWidth.value + rightWidth.value - room;
+    const rightCut = Math.min(overflow, Math.max(0, rightWidth.value - RIGHT_MIN));
+    rightWidth.value -= rightCut;
+    const leftCut = overflow - rightCut;
+    if (leftCut > 0) leftWidth.value -= Math.min(leftCut, Math.max(0, leftWidth.value - LEFT_MIN));
+  }
+  leftWidth.value = clamp(leftWidth.value, LEFT_MIN, Math.min(LEFT_MAX, room - rightWidth.value));
+  rightWidth.value = clamp(rightWidth.value, RIGHT_MIN, Math.min(RIGHT_MAX, room - leftWidth.value));
+}
+
+function saveWidths() {
+  try {
+    localStorage.setItem(
+      LAYOUT_KEY,
+      JSON.stringify({ left: leftWidth.value, right: rightWidth.value })
+    );
+  } catch {
+    /* 忽略隐私模式下的写入失败 */
+  }
+}
+
+function loadWidths() {
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as { left?: number; right?: number };
+    if (Number.isFinite(parsed.left)) leftWidth.value = clamp(Number(parsed.left), LEFT_MIN, LEFT_MAX);
+    if (Number.isFinite(parsed.right))
+      rightWidth.value = clamp(Number(parsed.right), RIGHT_MIN, RIGHT_MAX);
+  } catch {
+    /* 使用默认值 */
+  }
+}
+
+let stopResize: (() => void) | null = null;
+
+function startResize(side: "left" | "right", event: PointerEvent) {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startLeft = leftWidth.value;
+  const startRight = rightWidth.value;
+  const total = columnsTotal();
+  if (!total) return;
+  const room = total - MID_MIN - RESIZER_TOTAL;
+  const prevCursor = document.body.style.cursor;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  const move = (ev: PointerEvent) => {
+    if (side === "left") {
+      const raw = startLeft + (ev.clientX - startX);
+      leftWidth.value = clamp(raw, LEFT_MIN, Math.min(LEFT_MAX, room - startRight));
+    } else {
+      const raw = startRight - (ev.clientX - startX);
+      rightWidth.value = clamp(raw, RIGHT_MIN, Math.min(RIGHT_MAX, room - startLeft));
+    }
+  };
+  const up = () => {
+    document.body.style.cursor = prevCursor;
+    document.body.style.userSelect = "";
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    stopResize = null;
+    saveWidths();
+  };
+  stopResize = up;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
+function resetWidths() {
+  stopResize?.();
+  leftWidth.value = LEFT_DEFAULT;
+  rightWidth.value = RIGHT_DEFAULT;
+  clampWidths();
+  saveWidths();
+}
+
+let columnsObserver: ResizeObserver | null = null;
+
+// columnsRef 只在进入工作台（非迭代列表）后才存在：出现时再挂观察器
+watch(columnsRef, (el) => {
+  columnsObserver?.disconnect();
+  if (!el) return;
+  columnsObserver ??= new ResizeObserver(() => clampWidths());
+  columnsObserver.observe(el);
+  clampWidths();
+});
+
 let unlisten: UnlistenFn | null = null;
 let eventUnlisten: UnlistenFn | null = null;
 let pollTimer: number | null = null;
@@ -855,6 +978,12 @@ watch(
 );
 
 onMounted(async () => {
+  loadWidths();
+  if (columnsRef.value) {
+    columnsObserver = new ResizeObserver(() => clampWidths());
+    columnsObserver.observe(columnsRef.value);
+    clampWidths();
+  }
   await load();
   unlisten = await listen<{ task_id: number }>("task-updated", (ev) => {
     if (ev.payload?.task_id === props.taskId) scheduleReload();
@@ -868,6 +997,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  stopResize?.();
+  columnsObserver?.disconnect();
   unlisten?.();
   eventUnlisten?.();
   if (pollTimer) window.clearInterval(pollTimer);
@@ -976,7 +1107,7 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div class="wb-columns">
+      <div ref="columnsRef" class="wb-columns" :style="columnsStyle">
         <IterationTree
           :task="task"
           :iterations="iterations"
@@ -991,55 +1122,72 @@ onUnmounted(() => {
           @history="openHistory"
         />
 
-        <section class="wb-col">
-          <div v-if="!isLatestIteration" class="history-banner">
-            正在查看历史迭代 <b>{{ currentIteration?.version }}</b>
-            （当前最新版本 {{ iterations[iterations.length - 1]?.version || "待定" }}）。
-            <button class="link-btn" @click="backToIterations">返回迭代列表</button>
+        <div
+          class="wb-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整左栏宽度，双击恢复默认"
+          title="拖动调整左栏宽度，双击恢复默认"
+          @pointerdown.prevent="startResize('left', $event)"
+          @dblclick="resetWidths"
+        ></div>
+
+        <section class="wb-col wb-col-mid">
+          <!-- 固定区：追加需求 / 人工介入入口与「方案与契约」，不跟随对话滚动，也不覆盖内容 -->
+          <div class="wb-mid-head">
+            <div v-if="!isLatestIteration" class="history-banner">
+              正在查看历史迭代 <b>{{ currentIteration?.version }}</b>
+              （当前最新版本 {{ iterations[iterations.length - 1]?.version || "待定" }}）。
+              <button class="link-btn" @click="backToIterations">返回迭代列表</button>
+            </div>
+
+            <ActionDock
+              :task="task"
+              :subtasks="subtasks"
+              :human-target="humanTarget"
+              :design-gate-subtask="designGateSubtask"
+              :pending-human-subtask="pendingHumanSubtask"
+              :pending-plan="pendingPlan"
+              :can-human="canHuman"
+              :busy="actionBusy"
+              :human-stage-label="humanStageLabel"
+              :human-action-label="humanActionLabel"
+              :human-reason="humanReason"
+              @run="doRun"
+              @resume="doResume"
+              @followup="openFollowup"
+              @approve-plan="doApprovePlan"
+              @reject-plan="openPlanReject"
+              @approve-design="doApproveDesign"
+              @reject-design="openDesignReject"
+              @force-pass="forcePass"
+              @reject="openRejectModal"
+              @extend="extendRounds"
+              @global-force-pass="doGlobalForcePass"
+              @global-rework="openGlobalRework"
+            />
+
+            <!-- 方案与契约：主要内容入口固定在中栏顶部，点击后在右栏预览 -->
+            <div class="contract-bar">
+              <span class="contract-bar-title">方案与契约</span>
+              <button class="chip" @click="previewIterationRequirement">本次迭代需求</button>
+              <button class="chip" @click="contractPreview('requirement')">顶层需求</button>
+              <button class="chip" @click="contractPreview('criteria')">验收标准</button>
+              <button class="chip" @click="contractPreview('tech_stack')">技术栈</button>
+              <button class="chip" @click="contractPreview('contract')">全局契约</button>
+              <button class="chip" @click="previewSelectedDesign">
+                当前模块设计{{ selected?.design_content ? "" : "（暂无）" }}
+              </button>
+              <button class="chip" style="margin-left: auto" @click="openConsole">原始事件</button>
+            </div>
           </div>
 
-          <ActionDock
-            :task="task"
-            :subtasks="subtasks"
-            :human-target="humanTarget"
-            :design-gate-subtask="designGateSubtask"
-            :pending-human-subtask="pendingHumanSubtask"
-            :pending-plan="pendingPlan"
-            :can-human="canHuman"
-            :busy="actionBusy"
-            :human-stage-label="humanStageLabel"
-            :human-action-label="humanActionLabel"
-            :human-reason="humanReason"
-            @run="doRun"
-            @resume="doResume"
-            @followup="openFollowup"
-            @approve-plan="doApprovePlan"
-            @reject-plan="openPlanReject"
-            @approve-design="doApproveDesign"
-            @reject-design="openDesignReject"
-            @force-pass="forcePass"
-            @reject="openRejectModal"
-            @extend="extendRounds"
-            @global-force-pass="doGlobalForcePass"
-            @global-rework="openGlobalRework"
-          />
-
-          <!-- 方案与契约：主要内容入口固定在中栏顶部，点击后在右栏预览 -->
-          <div class="contract-bar">
-            <span class="contract-bar-title">方案与契约</span>
-            <button class="chip" @click="previewIterationRequirement">本次迭代需求</button>
-            <button class="chip" @click="contractPreview('requirement')">顶层需求</button>
-            <button class="chip" @click="contractPreview('criteria')">验收标准</button>
-            <button class="chip" @click="contractPreview('tech_stack')">技术栈</button>
-            <button class="chip" @click="contractPreview('contract')">全局契约</button>
-            <button class="chip" @click="previewSelectedDesign">
-              当前模块设计{{ selected?.design_content ? "" : "（暂无）" }}
-            </button>
-            <button class="chip" style="margin-left: auto" @click="openConsole">原始事件</button>
-          </div>
+          <!-- 滚动区：只有对话时间线 / 全局评审 / 系统日志在这里滚动 -->
+          <div class="wb-mid-scroll">
 
           <TimelinePanel
             v-model:show-tools="showTools"
+            :auto-scroll="!isPlanApproval"
             :events="executionEvents"
             :subtasks="subtasks"
             :iteration="currentIteration"
@@ -1155,37 +1303,6 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div
-            v-if="
-              isLatestIteration &&
-              task.status !== 'completed' &&
-              task.status !== 'terminated'
-            "
-            class="human-composer"
-          >
-            <div class="hc-title">
-              人工实时介入
-              <span class="small muted">消息会在下一个 Agent 步骤注入；不会清空任何数据</span>
-            </div>
-            <div class="hc-row">
-              <textarea
-                v-model="humanMessage"
-                rows="2"
-                placeholder="随时输入消息，例如：先完成登录再做列表；接口统一使用 snake_case；停止当前方案…"
-                @keydown.ctrl.enter.prevent="sendMessage"
-              ></textarea>
-              <button class="btn btn-primary" :disabled="actionBusy" @click="sendMessage">
-                发送介入
-              </button>
-            </div>
-            <div v-if="pendingMessages.length" class="pending-msgs">
-              <span class="small muted">待注入：</span>
-              <span v-for="m in pendingMessages" :key="m.id" class="pending-msg">
-                {{ m.content }}
-              </span>
-            </div>
-          </div>
-
           <details class="system-logs">
             <summary>系统事件日志（{{ logs.length }}）</summary>
             <div ref="logBox" class="log-box">
@@ -1198,7 +1315,53 @@ onUnmounted(() => {
               </div>
             </div>
           </details>
+          </div>
+          <!-- /滚动区 -->
+
+          <!-- 固定区：人工实时介入输入框固定在底部，不遮挡对话内容 -->
+          <div
+            v-if="
+              isLatestIteration &&
+              task.status !== 'completed' &&
+              task.status !== 'terminated'
+            "
+            class="wb-mid-foot"
+          >
+            <div class="human-composer">
+              <div class="hc-title">
+                人工实时介入
+                <span class="small muted">消息会在下一个 Agent 步骤注入；不会清空任何数据</span>
+              </div>
+              <div class="hc-row">
+                <textarea
+                  v-model="humanMessage"
+                  rows="2"
+                  placeholder="随时输入消息，例如：先完成登录再做列表；接口统一使用 snake_case；停止当前方案…"
+                  @keydown.ctrl.enter.prevent="sendMessage"
+                ></textarea>
+                <button class="btn btn-primary" :disabled="actionBusy" @click="sendMessage">
+                  发送介入
+                </button>
+              </div>
+              <div v-if="pendingMessages.length" class="pending-msgs">
+                <span class="small muted">待注入：</span>
+                <span v-for="m in pendingMessages" :key="m.id" class="pending-msg">
+                  {{ m.content }}
+                </span>
+              </div>
+            </div>
+          </div>
         </section>
+
+        <div
+          class="wb-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整右栏宽度，双击恢复默认"
+          title="拖动调整右栏宽度，双击恢复默认"
+          @pointerdown.prevent="startResize('right', $event)"
+          @dblclick="resetWidths"
+        ></div>
 
         <PreviewPanel
           :preview="preview"

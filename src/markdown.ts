@@ -29,6 +29,18 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   return defaultLinkOpen(tokens, idx, options, env, self);
 };
 
+// 表格外包一层横向滚动容器：宽表格只在面板内滚动，不会把文字顶出窗口。
+const defaultTableOpen =
+  md.renderer.rules.table_open ??
+  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+md.renderer.rules.table_open = (tokens, idx, options, env, self) =>
+  `<div class="md-table-wrap">${defaultTableOpen(tokens, idx, options, env, self)}`;
+const defaultTableClose =
+  md.renderer.rules.table_close ??
+  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+md.renderer.rules.table_close = (tokens, idx, options, env, self) =>
+  `${defaultTableClose(tokens, idx, options, env, self)}</div>`;
+
 /** 渲染 Markdown 为安全 HTML 字符串。空内容返回空串。 */
 export function renderMarkdown(raw: string): string {
   if (!raw || !raw.trim()) return "";

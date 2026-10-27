@@ -380,7 +380,7 @@ const taskMain = {
   create_time: "2026-10-27 08:59:00",
   manual_review_enabled: false,
   tech_stack:
-    "# 技术栈\n- 前端：Vue 3 + TypeScript + Vite\n- 状态：组件本地状态 + props/emits\n- 样式：原生 CSS + CSS 变量\n- 测试：Vitest\n- 构建：Vite build",
+    "# 技术栈\n- 前端：Vue 3 + TypeScript + Vite\n- 状态：组件本地状态 + props/emits\n- 样式：原生 CSS + CSS 变量\n- 测试：Vitest\n- 构建：Vite build\n\n## 依赖与接口约定\n\n| 模块 | 接口 | 约定 |\n| --- | --- | --- |\n| 日程 CRUD | `/api/events` | 时间统一 ISO 字符串，前端按本地时区展示；分页参数 page 从 1 开始，size 默认 20 且最大 100 |\n| 导出 | `/api/export/markdown` | 返回 `text/markdown`，文件名形如 `2026-10-27-plan.md`，导出失败返回统一错误结构 |\n\n> 超长标识符也不会把面板顶破：`ApiResponse<PagedResult<CalendarEventVO>>`",
   pending_plan_json: "",
   cancel_requested: false,
   execution_mode: "later" as const,
@@ -494,8 +494,13 @@ function planApprovalDetail(): TaskDetail {
 
 function taskDetail(iterationId: number | null): TaskDetail {
   if (mockScene() === "plan") return planApprovalDetail();
+  // 已完成任务：用来看「追加需求，继续迭代」固定面板
+  const task =
+    mockScene() === "completed"
+      ? { ...taskMain, status: "completed" as const, task_phase: "module_dev" as const }
+      : taskMain;
   return {
-    task: taskMain,
+    task,
     subtasks,
     logs: iterationId ? logs.filter((l) => l.iteration_id === iterationId) : logs,
     reviewer,

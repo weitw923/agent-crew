@@ -12,6 +12,8 @@ const props = defineProps<{
   /** 只看某个子任务（左栏「查看」触发）。 */
   focusSubtaskId: number | null;
   showTools: boolean;
+  /** 首次装载时是否自动滚到最新一条（方案审批页需要从顶部开始读）。 */
+  autoScroll?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -334,16 +336,49 @@ function highlight(raw: string, limit = 6000): Segment[] {
   return out;
 }
 
+/** 时间线自身不再滚动：整体滚动交给中栏的 .wb-mid-scroll。 */
+function scrollContainer(): HTMLElement | null {
+  let el = box.value?.parentElement ?? null;
+  while (el) {
+    const style = getComputedStyle(el);
+    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight) return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+
 function scrollToBottom() {
-  const el = box.value;
+  const el = scrollContainer();
   if (el) el.scrollTop = el.scrollHeight;
 }
+
+// 切换迭代后重新允许自动定位到底部
+watch(
+  () => props.iteration?.id,
+  () => {
+    firstScrollDone = false;
+  }
+);
+
+/** 用户已经往上翻看历史时，不要用新消息把他拽回底部。 */
+function nearBottom() {
+  const el = scrollContainer();
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 240;
+}
+
+let firstScrollDone = false;
 
 watch(
   () => [props.events.length, props.focusSubtaskId, roleFilter.value, props.showTools],
   async () => {
     await nextTick();
-    scrollToBottom();
+    if (!firstScrollDone) {
+      firstScrollDone = true;
+      if (props.autoScroll !== false) scrollToBottom();
+      return;
+    }
+    if (nearBottom()) scrollToBottom();
   }
 );
 
@@ -352,6 +387,8 @@ defineExpose({ scrollToBottom });
 
 <template>
   <section class="timeline-panel">
+    <!-- 工具条 + 搜索：吸附在中栏滚动区顶部，避免滚到对话深处后找不到筛选 -->
+    <div class="timeline-sticky">
     <div class="conv-toolbar">
       <span class="conv-title">评审者与 Coder 的完整对话</span>
       <button class="chip" :class="{ active: roleFilter === 'all' }" @click="roleFilter = 'all'">
@@ -414,6 +451,7 @@ defineExpose({ scrollToBottom });
       />
       <span v-if="keyword" class="search-count">{{ hitCount }} 条命中</span>
       <button v-if="keyword" class="link-btn" @click="searchText = ''">清除</button>
+    </div>
     </div>
 
     <div ref="box" class="timeline-box">

@@ -738,12 +738,17 @@ input[type="range"] {
 .wb-columns {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: grid;
-  grid-template-columns: 330px minmax(0, 1fr) 370px;
+  grid-template-columns:
+    var(--wb-left-w, 330px) 6px minmax(0, 1fr) 6px
+    var(--wb-right-w, 400px);
   gap: 0;
+  overflow: hidden;
 }
 .wb-col {
   min-height: 0;
+  min-width: 0;
   overflow: auto;
   padding: 14px;
   display: flex;
@@ -753,14 +758,101 @@ input[type="range"] {
 .wb-col > * {
   flex-shrink: 0;
 }
-.wb-col + .wb-col {
-  border-left: 1px solid var(--line-soft);
-}
 .wb-col.left {
   background: var(--col-left-bg);
 }
 .wb-col.right {
   background: var(--col-right-bg);
+  overflow-x: hidden;
+}
+.wb-col.left,
+.wb-col.right {
+  scrollbar-gutter: stable;
+}
+/* 中栏：上/下固定，只有中间对话区滚动 */
+.wb-col-mid {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--line-soft);
+  border-right: 1px solid var(--line-soft);
+}
+.wb-mid-head {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--dock-bg);
+}
+.wb-mid-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 顶部不留 padding：吸顶工具条才能紧贴滚动区上沿，否则会漏出 12px 内容 */
+  padding: 0 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wb-mid-scroll > .timeline-panel {
+  margin-top: 10px;
+}
+.wb-mid-scroll > * {
+  flex-shrink: 0;
+}
+.wb-mid-foot {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--dock-bg);
+}
+
+/* 三栏拖动分隔条 */
+.wb-resizer {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+  background: transparent;
+  outline: none;
+}
+.wb-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+  background: var(--line-soft);
+  transition: background 0.12s ease;
+}
+.wb-resizer::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 34px;
+  transform: translate(-50%, -50%);
+  border-radius: 3px;
+  background: var(--line);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.wb-resizer:hover::before,
+.wb-resizer:active::before {
+  background: var(--accent);
+}
+.wb-resizer:hover::after,
+.wb-resizer:active::after {
+  background: var(--accent);
+  opacity: 0.85;
 }
 .wb-section-title {
   font-size: 11px;
@@ -1122,9 +1214,7 @@ input[type="range"] {
 }
 
 @media (max-width: 1280px) {
-  .wb-columns {
-    grid-template-columns: 300px minmax(0, 1fr) 330px;
-  }
+  /* 三栏宽度改由 JS 变量控制（可拖动），此处不再写死列宽 */
   .split {
     grid-template-columns: 320px 1fr;
   }
@@ -1193,16 +1283,12 @@ input[type="range"] {
 }
 
 .human-composer {
-  margin-top: auto;
   flex: 0 0 auto;
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
+  position: static;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: var(--composer-bg);
   padding: 10px 11px;
-  box-shadow: 0 -8px 22px rgba(0, 0, 0, 0.28);
 }
 .hc-title {
   font-size: 12px;
@@ -1313,14 +1399,16 @@ input[type="range"] {
 }
 
 .action-dock {
-  position: sticky;
-  top: 0;
-  z-index: 8;
+  /* 固定在中栏头部：身在文档流中，不使用 sticky / 半透明覆盖，滚动内容不会跑到它下面 */
+  position: static;
   flex: 0 0 auto;
+  min-width: 0;
+}
+.action-dock:empty {
+  display: none;
 }
 .action-dock .human-bar {
-  background: var(--dock-bg);
-  backdrop-filter: blur(8px);
+  background: rgba(107, 140, 255, 0.035);
 }
 
 /* ---------------- V2：主题 / 执行模式 / 会话 ---------------- */
@@ -2250,9 +2338,27 @@ html[data-theme="light"] .completed-panel {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--panel);
-  overflow: hidden;
+  /* 不再裁剪：工具条需要相对中栏滚动区吸顶 */
+  overflow: visible;
   display: flex;
   flex-direction: column;
+}
+.timeline-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-radius: 11px 11px 0 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.timeline-sticky .conv-toolbar {
+  border-bottom: 0;
+  border-radius: 11px 11px 0 0;
+}
+.timeline-sticky .timeline-search {
+  border-top: 1px solid var(--line-soft);
 }
 .conv-title {
   font-size: 11.5px;
@@ -2269,9 +2375,6 @@ html[data-theme="light"] .completed-panel {
   color: var(--accent);
 }
 .timeline-box {
-  max-height: 58vh;
-  min-height: 260px;
-  overflow: auto;
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -2294,6 +2397,7 @@ html[data-theme="light"] .completed-panel {
   background: var(--line-soft);
 }
 .timeline-item {
+  scroll-margin-top: 96px;
   display: flex;
   gap: 9px;
   align-items: flex-start;
@@ -2415,9 +2519,44 @@ html[data-theme="light"] .completed-panel {
   min-width: 0;
 }
 
+/* 长串 / 长 URL 兜底换行：WKWebView 下 word-break: break-word 不足以避免撑破容器 */
+.timeline-pre,
+.timeline-system,
+.timeline-preview-text,
+.ev-content,
+.hp-reason-text,
+.pm-criteria,
+.preview-content,
+.preview-title,
+.preview-source,
+.hc-title,
+.log-line {
+  overflow-wrap: anywhere;
+}
+
 /* ---------------- 右栏：预览面板 ---------------- */
 .preview-col {
   gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+}
+/* 右栏内部一律不许横向溢出：宽内容（表格/长串）在各自容器内滚动或换行 */
+.preview-col > *,
+.preview-panel,
+.preview-head,
+.preview-subtask,
+.preview-criteria,
+.preview-empty {
+  min-width: 0;
+  max-width: 100%;
+}
+.preview-title,
+.preview-source,
+.preview-time {
+  overflow-wrap: anywhere;
+}
+.preview-content {
+  overflow-x: hidden;
 }
 .preview-shortcuts {
   display: flex;
@@ -2722,7 +2861,11 @@ html[data-theme="light"] .timeline-hit {
   color: var(--text-2);
   font-size: 12.5px;
   line-height: 1.75;
+  /* WKWebView 下仅 break-word 不足以保证表格/长串不撑破容器，这里同时兜底 */
   word-break: break-word;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 100%;
 }
 .md-body > :first-child {
   margin-top: 0;
@@ -2800,6 +2943,7 @@ html[data-theme="light"] .timeline-hit {
   border-radius: 8px;
   overflow: auto;
   max-height: 320px;
+  max-width: 100%;
 }
 .md-body pre code {
   padding: 0;
@@ -2826,11 +2970,27 @@ html[data-theme="light"] .timeline-hit {
   border: 0;
   border-top: 1px solid var(--line-soft);
 }
+/* 宽表格：在面板内部横向滚动，而不是把文字顶出应用窗口 */
+.md-table-wrap {
+  max-width: 100%;
+  margin: 10px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.md-table-wrap > table {
+  margin: 0;
+}
 .md-body table {
   width: 100%;
   margin: 10px 0;
   border-collapse: collapse;
   font-size: 12px;
+  table-layout: auto;
+}
+.md-table-wrap > table {
+  /* 默认铺满面板并自动换行；仅当确实压不下去时由外层容器横向滚动兜底 */
+  width: 100%;
+  min-width: 0;
 }
 .md-body th,
 .md-body td {
@@ -2838,6 +2998,8 @@ html[data-theme="light"] .timeline-hit {
   padding: 6px 9px;
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .md-body th {
   background: var(--bg-soft);
@@ -2853,7 +3015,9 @@ html[data-theme="light"] .timeline-hit {
 .preview-content-md {
   padding: 11px;
   max-height: 62vh;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
 }
 .preview-criteria {
   margin-top: 6px;
@@ -2867,5 +3031,7 @@ html[data-theme="light"] .timeline-hit {
 }
 .md-scroll {
   max-height: 260px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
 }
