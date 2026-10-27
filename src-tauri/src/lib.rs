@@ -114,6 +114,8 @@ pub fn run() {
             commands::resume_task,
             commands::append_requirement,
             commands::get_task_detail,
+            commands::list_iterations,
+            commands::get_iteration_detail,
             commands::list_task_events,
             commands::delete_task,
             commands::human_force_pass,

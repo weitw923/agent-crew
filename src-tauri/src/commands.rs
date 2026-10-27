@@ -173,6 +173,25 @@ pub fn list_task_events(
 }
 
 #[tauri::command]
+pub fn list_iterations(
+    state: State<'_, AppState>,
+    task_id: i64,
+) -> Result<Vec<crate::models::Iteration>, String> {
+    let conn = db::open(&state.db_path()?)?;
+    db::list_iterations(&conn, task_id)
+}
+
+#[tauri::command]
+pub fn get_iteration_detail(
+    state: State<'_, AppState>,
+    task_id: i64,
+    iteration_id: i64,
+) -> Result<crate::models::IterationDetail, String> {
+    let conn = db::open(&state.db_path()?)?;
+    db::get_iteration_detail(&conn, task_id, iteration_id)
+}
+
+#[tauri::command]
 pub fn delete_task(app: AppHandle, task_id: i64) -> Result<(), String> {
     ensure_not_running(&app, task_id)?;
     let state = app.state::<AppState>();

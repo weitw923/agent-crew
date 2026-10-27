@@ -2,11 +2,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use chrono::Local;
-use rusqlite::{params, Connection, Row};
+use chrono::{Local, NaiveDateTime};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::models::{
-    AgentConfig, AgentInput, AppSettings, ChatMessage, GlobalReviewRecord, HumanMessage,
+    AgentConfig, AgentInput, AppSettings, ChatMessage, GlobalReviewRecord, HumanMessage, Iteration,
     IterationRecord, NewTaskInput, PendingPlan, Subtask, TaskConfigInput, TaskDetail, TaskEvent,
     TaskLog, TaskMain, TaskSummary,
 };
@@ -99,15 +99,32 @@ CREATE TABLE IF NOT EXISTS subtask (
     summary_content   TEXT NOT NULL DEFAULT '',
     summary_file_path TEXT NOT NULL DEFAULT '',
     iteration_records TEXT NOT NULL DEFAULT '[]',
-    design_content    TEXT NOT NULL DEFAULT ''
+    design_content    TEXT NOT NULL DEFAULT '',
+    iteration_id      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
-    level       TEXT NOT NULL DEFAULT 'info',
-    message     TEXT NOT NULL,
-    create_time TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    iteration_id INTEGER NOT NULL DEFAULT 0,
+    level        TEXT NOT NULL DEFAULT 'info',
+    message      TEXT NOT NULL,
+    create_time  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS iteration (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    version      TEXT NOT NULL DEFAULT '',
+    major        INTEGER NOT NULL DEFAULT 0,
+    minor        INTEGER NOT NULL DEFAULT 0,
+    requirement  TEXT NOT NULL DEFAULT '',
+    analysis     TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    start_time   TEXT NOT NULL DEFAULT '',
+    end_time     TEXT NOT NULL DEFAULT '',
+    token_total  INTEGER NOT NULL DEFAULT -1,
+    create_time  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS app_setting (
@@ -116,12 +133,13 @@ CREATE TABLE IF NOT EXISTS app_setting (
 );
 
 CREATE TABLE IF NOT EXISTS task_event (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
-    subtask_id  INTEGER,
-    kind        TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    create_time TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    iteration_id INTEGER NOT NULL DEFAULT 0,
+    subtask_id   INTEGER,
+    kind         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    create_time  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS human_message (
@@ -143,6 +161,7 @@ CREATE TABLE IF NOT EXISTS chat_message (
 CREATE INDEX IF NOT EXISTS idx_subtask_task ON subtask(task_id, sort_index);
 CREATE INDEX IF NOT EXISTS idx_task_log_task ON task_log(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_event_task ON task_event(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_iteration_task ON iteration(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_human_message_task ON human_message(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_chat_message_task ON chat_message(task_id, id);
 "#;
@@ -261,6 +280,45 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     ] {
         ensure_column(conn, "task_main", column, ddl)?;
     }
+    // ---- V2.3：任务迭代（版本） ----
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS iteration (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+            version      TEXT NOT NULL DEFAULT '',
+            major        INTEGER NOT NULL DEFAULT 0,
+            minor        INTEGER NOT NULL DEFAULT 0,
+            requirement  TEXT NOT NULL DEFAULT '',
+            analysis     TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'pending',
+            start_time   TEXT NOT NULL DEFAULT '',
+            end_time     TEXT NOT NULL DEFAULT '',
+            token_total  INTEGER NOT NULL DEFAULT -1,
+            create_time  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iteration_task ON iteration(task_id, id);",
+    )
+    .map_err(|e| e.to_string())?;
+    ensure_column(
+        conn,
+        "subtask",
+        "iteration_id",
+        "iteration_id INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_log",
+        "iteration_id",
+        "iteration_id INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "task_event",
+        "iteration_id",
+        "iteration_id INTEGER NOT NULL DEFAULT 0",
+    )?;
+    backfill_iterations(conn)?;
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS chat_message (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -537,12 +595,23 @@ pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
             })
             .collect::<Vec<_>>();
         let (subtask_count, completed_count) = subtask_counts(conn, task.id)?;
+        let version = conn
+            .query_row(
+                "SELECT version FROM iteration WHERE task_id=?1 AND version<>''
+                 ORDER BY major DESC, minor DESC, id DESC LIMIT 1",
+                params![task.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
         out.push(TaskSummary {
             task,
             reviewer_name,
             coder_names,
             subtask_count,
             completed_count,
+            version,
         });
     }
     Ok(out)
@@ -636,7 +705,11 @@ pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, Strin
         ],
     )
     .map_err(|e| e.to_string())?;
-    Ok(conn.last_insert_rowid())
+    let task_id = conn.last_insert_rowid();
+    // 首次创建任务即登记 dev-1.0，后续追加需求在此基础上递增版本号。
+    let iteration_id = create_iteration(conn, task_id, input.top_requirement.trim())?;
+    settle_iteration(conn, iteration_id, "dev-1.0", 1, 0)?;
+    Ok(task_id)
 }
 
 /// 只持久化调度过程中会变化的字段。
@@ -682,6 +755,340 @@ pub fn delete_task(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+
+// ------------------------------------------------------------------
+// Iteration（任务迭代 / 版本）
+// ------------------------------------------------------------------
+/// 单次追加需求拆出的子任务数超过该阈值时，版本号升大版本。
+pub const COMPLEX_SUBTASK_THRESHOLD: i64 = 5;
+
+fn parse_local(s: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S").ok()
+}
+
+/// 迭代耗时（秒）：已有开始时间即返回；未结束时按当前时间计算。
+pub fn duration_sec(start_time: &str, end_time: &str) -> i64 {
+    if start_time.trim().is_empty() {
+        return 0;
+    }
+    let Some(start) = parse_local(start_time) else {
+        return 0;
+    };
+    let end = if end_time.trim().is_empty() {
+        Local::now().naive_local()
+    } else {
+        match parse_local(end_time) {
+            Some(v) => v,
+            None => return 0,
+        }
+    };
+    (end - start).num_seconds().max(0)
+}
+
+fn row_to_iteration(row: &Row<'_>) -> rusqlite::Result<Iteration> {
+    let start_time: String = row.get("start_time")?;
+    let end_time: String = row.get("end_time")?;
+    Ok(Iteration {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        version: row.get("version")?,
+        major: row.get("major")?,
+        minor: row.get("minor")?,
+        requirement: row.get("requirement")?,
+        analysis: row.get("analysis")?,
+        status: row.get("status")?,
+        duration_sec: duration_sec(&start_time, &end_time),
+        start_time,
+        end_time,
+        token_total: row.get("token_total")?,
+        subtask_total: 0,
+        subtask_completed: 0,
+        create_time: row.get("create_time")?,
+    })
+}
+
+const ITERATION_COLS: &str = "id,task_id,version,major,minor,requirement,analysis,status,
+    start_time,end_time,token_total,create_time";
+
+/// 新建一个「待定」迭代（需求梳理完成前 version 为空，之后由 settle 落定）。
+pub fn create_iteration(
+    conn: &Connection,
+    task_id: i64,
+    requirement: &str,
+) -> Result<i64, String> {
+    let create_time = now();
+    conn.execute(
+        "INSERT INTO iteration(task_id,version,major,minor,requirement,analysis,status,
+            start_time,end_time,token_total,create_time)
+         VALUES (?1,'',0,0,?2,'','pending','','',-1,?3)",
+        params![task_id, requirement.trim(), create_time],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 落定版本号。
+pub fn settle_iteration(
+    conn: &Connection,
+    iteration_id: i64,
+    version: &str,
+    major: i64,
+    minor: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE iteration SET version=?1, major=?2, minor=?3 WHERE id=?4",
+        params![version, major, minor, iteration_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn set_iteration_analysis(conn: &Connection, iteration_id: i64, analysis: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE iteration SET analysis=?1 WHERE id=?2",
+        params![analysis.trim(), iteration_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 计算下一个版本号：默认小版本 +1，子任务数超过阈值时大版本 +1 且小版本归零。
+pub fn next_iteration_version(
+    conn: &Connection,
+    task_id: i64,
+    subtask_count: i64,
+) -> Result<(String, i64, i64), String> {
+    let last: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT major,minor FROM iteration
+             WHERE task_id=?1 AND version<>''
+             ORDER BY major DESC, minor DESC, id DESC LIMIT 1",
+            params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (major, minor) = match last {
+        None => (1, 0),
+        Some((major, minor)) => {
+            if subtask_count > COMPLEX_SUBTASK_THRESHOLD {
+                (major + 1, 0)
+            } else {
+                (major, minor + 1)
+            }
+        }
+    };
+    Ok((format!("dev-{major}.{minor}"), major, minor))
+}
+
+pub fn list_iterations(conn: &Connection, task_id: i64) -> Result<Vec<Iteration>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ITERATION_COLS},
+                (SELECT COUNT(*) FROM subtask s WHERE s.iteration_id=iteration.id) AS subtask_total,
+                (SELECT COUNT(*) FROM subtask s WHERE s.iteration_id=iteration.id AND s.status='completed') AS subtask_completed
+             FROM iteration WHERE task_id=?1 ORDER BY major, minor, id"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id], |row| {
+            let mut it = row_to_iteration(row)?;
+            it.subtask_total = row.get("subtask_total")?;
+            it.subtask_completed = row.get("subtask_completed")?;
+            Ok(it)
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn get_iteration(conn: &Connection, iteration_id: i64) -> Result<Option<Iteration>, String> {
+    let all: Option<Iteration> = conn
+        .query_row(
+            &format!("SELECT {ITERATION_COLS} FROM iteration WHERE id=?1"),
+            params![iteration_id],
+            row_to_iteration,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(all)
+}
+
+/// 当前迭代 = 最新创建的那个（含尚未落定版本号的待定迭代）。
+pub fn current_iteration_id(conn: &Connection, task_id: i64) -> i64 {
+    conn.query_row(
+        "SELECT id FROM iteration WHERE task_id=?1 ORDER BY id DESC LIMIT 1",
+        params![task_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+}
+
+/// 标记当前迭代开始计时（重复调用不覆盖已有开始时间）。
+pub fn mark_iteration_started(conn: &Connection, task_id: i64) -> Result<(), String> {
+    let id = current_iteration_id(conn, task_id);
+    if id == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE iteration SET start_time=CASE WHEN start_time='' THEN ?1 ELSE start_time END,
+            status=CASE WHEN status IN ('completed','terminated','failed') THEN status ELSE 'running' END
+         WHERE id=?2",
+        params![now(), id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 重新打开当前迭代（例如继续已终止任务时）。
+pub fn reopen_current_iteration(conn: &Connection, task_id: i64) -> Result<(), String> {
+    let id = current_iteration_id(conn, task_id);
+    if id == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE iteration SET status='running', end_time='' WHERE id=?1",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 标记当前迭代结束（写入结束时间与最终状态）。
+pub fn mark_iteration_finished(conn: &Connection, task_id: i64, status: &str) -> Result<(), String> {
+    let id = current_iteration_id(conn, task_id);
+    if id == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE iteration SET end_time=CASE WHEN end_time='' THEN ?1 ELSE end_time END, status=?2
+         WHERE id=?3",
+        params![now(), status, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 把尚未归档的子任务/日志/事件挂到指定迭代。
+pub fn assign_iteration_records(
+    conn: &Connection,
+    task_id: i64,
+    iteration_id: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE subtask SET iteration_id=?1 WHERE task_id=?2 AND iteration_id=0",
+        params![iteration_id, task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE task_log SET iteration_id=?1 WHERE task_id=?2 AND iteration_id=0",
+        params![iteration_id, task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE task_event SET iteration_id=?1 WHERE task_id=?2 AND iteration_id=0",
+        params![iteration_id, task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 旧库升级：为没有迭代数据的任务补建 dev-1.0，并把既有子任务/日志/事件归档进去。
+fn backfill_iterations(conn: &Connection) -> Result<(), String> {
+    let tasks: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id,top_requirement,status,create_time FROM task_main")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?
+    };
+    for (task_id, requirement, status, create_time) in tasks {
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM iteration WHERE task_id=?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if existing > 0 {
+            // 已有迭代：仍把游离记录挂回第一个迭代，保证不出现无归属数据。
+            let first: i64 = conn
+                .query_row(
+                    "SELECT id FROM iteration WHERE task_id=?1 ORDER BY id LIMIT 1",
+                    params![task_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            assign_iteration_records(conn, task_id, first)?;
+            continue;
+        }
+        let iter_status = match status.as_str() {
+            "completed" => "completed",
+            "terminated" => "terminated",
+            "failed" => "failed",
+            "pending" | "planning" => "pending",
+            _ => "running",
+        };
+        let end_time = if iter_status == "completed" {
+            legacy_end_time(conn, task_id).unwrap_or_else(|| create_time.clone())
+        } else {
+            String::new()
+        };
+        conn.execute(
+            "INSERT INTO iteration(task_id,version,major,minor,requirement,analysis,status,
+                start_time,end_time,token_total,create_time)
+             VALUES (?1,'dev-1.0',1,0,?2,'',?3,?4,?5,-1,?6)",
+            params![
+                task_id,
+                requirement,
+                iter_status,
+                create_time,
+                end_time,
+                create_time
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let iteration_id = conn.last_insert_rowid();
+        assign_iteration_records(conn, task_id, iteration_id)?;
+    }
+    Ok(())
+}
+
+fn legacy_end_time(conn: &Connection, task_id: i64) -> Option<String> {
+    let from_events: Option<String> = conn
+        .query_row(
+            "SELECT MAX(create_time) FROM task_event WHERE task_id=?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    from_events.or_else(|| {
+        conn.query_row(
+            "SELECT MAX(create_time) FROM task_log WHERE task_id=?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    })
+}
+
 // ------------------------------------------------------------------
 // Subtask
 // ------------------------------------------------------------------
@@ -702,12 +1109,13 @@ fn row_to_subtask(row: &Row<'_>) -> rusqlite::Result<Subtask> {
         summary_file_path: row.get("summary_file_path")?,
         iteration_records: parse_json(&records_raw),
         design_content: row.get("design_content").unwrap_or_default(),
+        iteration_id: row.get("iteration_id").unwrap_or_default(),
     })
 }
 
 const SUBTASK_COLS: &str = "id,task_id,subtask_name,sort_index,accept_criteria,assigned_coder_id,
     current_round,max_round,status,current_stage,summary_content,summary_file_path,iteration_records,
-    design_content";
+    design_content,iteration_id";
 
 pub fn list_subtasks(conn: &Connection, task_id: i64) -> Result<Vec<Subtask>, String> {
     let mut stmt = conn
@@ -751,19 +1159,21 @@ fn insert_subtasks_from(
     max_round: i64,
     start_index: i64,
 ) -> Result<Vec<Subtask>, String> {
+    let iteration_id = current_iteration_id(conn, task_id);
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     for (i, (name, criteria)) in items.iter().enumerate() {
         tx.execute(
             "INSERT INTO subtask(task_id,subtask_name,sort_index,accept_criteria,assigned_coder_id,
-                current_round,max_round,status,current_stage,summary_content,summary_file_path,iteration_records,design_content)
-             VALUES (?1,?2,?3,?4,?5,0,?6,'waiting','queued','','','[]','')",
+                current_round,max_round,status,current_stage,summary_content,summary_file_path,iteration_records,design_content,iteration_id)
+             VALUES (?1,?2,?3,?4,?5,0,?6,'waiting','queued','','','[]','',?7)",
             params![
                 task_id,
                 name.trim(),
                 start_index + i as i64,
                 criteria,
                 coder_id,
-                max_round
+                max_round,
+                iteration_id
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -777,8 +1187,8 @@ pub fn save_subtask(conn: &Connection, subtask: &Subtask) -> Result<(), String> 
         .map_err(|e| format!("迭代记录序列化失败: {e}"))?;
     conn.execute(
         "UPDATE subtask SET assigned_coder_id=?1, current_round=?2, status=?3, current_stage=?4,
-            summary_content=?5, summary_file_path=?6, iteration_records=?7, design_content=?8
-            WHERE id=?9",
+            summary_content=?5, summary_file_path=?6, iteration_records=?7, design_content=?8,
+            iteration_id=?9 WHERE id=?10",
         params![
             subtask.assigned_coder_id,
             subtask.current_round,
@@ -788,6 +1198,7 @@ pub fn save_subtask(conn: &Connection, subtask: &Subtask) -> Result<(), String> 
             subtask.summary_file_path,
             records,
             subtask.design_content,
+            subtask.iteration_id,
             subtask.id
         ],
     )
@@ -802,6 +1213,7 @@ fn row_to_log(row: &Row<'_>) -> rusqlite::Result<TaskLog> {
     Ok(TaskLog {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
+        iteration_id: row.get("iteration_id").unwrap_or_default(),
         level: row.get("level")?,
         message: row.get("message")?,
         create_time: row.get("create_time")?,
@@ -819,19 +1231,23 @@ pub fn add_log(
         return Ok(TaskLog {
             id: synthetic_id(),
             task_id,
+            iteration_id: current_iteration_id(conn, task_id),
             level: level.to_string(),
             message: message.to_string(),
             create_time,
         });
     }
+    let iteration_id = current_iteration_id(conn, task_id);
     conn.execute(
-        "INSERT INTO task_log(task_id,level,message,create_time) VALUES (?1,?2,?3,?4)",
-        params![task_id, level, message, create_time],
+        "INSERT INTO task_log(task_id,iteration_id,level,message,create_time)
+         VALUES (?1,?2,?3,?4,?5)",
+        params![task_id, iteration_id, level, message, create_time],
     )
     .map_err(|e| e.to_string())?;
     Ok(TaskLog {
         id: conn.last_insert_rowid(),
         task_id,
+        iteration_id,
         level: level.to_string(),
         message: message.to_string(),
         create_time,
@@ -842,8 +1258,8 @@ pub fn list_logs(conn: &Connection, task_id: i64) -> Result<Vec<TaskLog>, String
     // 只取最近 800 条，避免超长任务把页面拖慢。
     let mut stmt = conn
         .prepare(
-            "SELECT id,task_id,level,message,create_time FROM (
-                SELECT id,task_id,level,message,create_time FROM task_log
+            "SELECT id,task_id,iteration_id,level,message,create_time FROM (
+                SELECT id,task_id,iteration_id,level,message,create_time FROM task_log
                 WHERE task_id=?1 ORDER BY id DESC LIMIT 800
              ) ORDER BY id ASC",
         )
@@ -878,6 +1294,7 @@ pub fn get_task_detail(conn: &Connection, task_id: i64) -> Result<TaskDetail, St
         Some(pending_plan)
     };
     let chat_messages = list_chat_messages(conn, task_id, 300)?;
+    let iterations = list_iterations(conn, task_id)?;
     Ok(TaskDetail {
         task,
         subtasks,
@@ -888,7 +1305,96 @@ pub fn get_task_detail(conn: &Connection, task_id: i64) -> Result<TaskDetail, St
         human_messages,
         pending_plan,
         chat_messages,
+        iterations,
     })
+}
+
+/// 单个迭代的详情：只看该迭代范围内的子任务 / 事件 / 日志。
+pub fn get_iteration_detail(
+    conn: &Connection,
+    task_id: i64,
+    iteration_id: i64,
+) -> Result<crate::models::IterationDetail, String> {
+    let task = get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    let iteration = get_iteration(conn, iteration_id)?
+        .filter(|i| i.task_id == task_id)
+        .ok_or_else(|| "迭代不存在或不属于该任务".to_string())?;
+    let reviewer = get_agent(conn, task.reviewer_agent_id)?;
+    let mut coders = Vec::new();
+    for id in &task.coder_agent_ids {
+        if let Some(a) = get_agent(conn, *id)? {
+            coders.push(a);
+        }
+    }
+    let iterations = list_iterations(conn, task_id)?;
+    let subtasks = list_iteration_subtasks(conn, task_id, iteration_id)?;
+    let logs = list_iteration_logs(conn, task_id, iteration_id)?;
+    let execution_events = list_iteration_events(conn, task_id, iteration_id)?;
+    let human_messages = list_human_messages(conn, task_id)?;
+    Ok(crate::models::IterationDetail {
+        task,
+        iteration,
+        iterations,
+        subtasks,
+        logs,
+        reviewer,
+        coders,
+        execution_events,
+        human_messages,
+    })
+}
+
+pub fn list_iteration_subtasks(
+    conn: &Connection,
+    task_id: i64,
+    iteration_id: i64,
+) -> Result<Vec<Subtask>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SUBTASK_COLS} FROM subtask WHERE task_id=?1 AND iteration_id=?2 ORDER BY sort_index"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id, iteration_id], row_to_subtask)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn list_iteration_logs(
+    conn: &Connection,
+    task_id: i64,
+    iteration_id: i64,
+) -> Result<Vec<TaskLog>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,task_id,iteration_id,level,message,create_time FROM task_log
+             WHERE task_id=?1 AND iteration_id=?2 ORDER BY id ASC LIMIT 2000",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id, iteration_id], row_to_log)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn list_iteration_events(
+    conn: &Connection,
+    task_id: i64,
+    iteration_id: i64,
+) -> Result<Vec<TaskEvent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM task_event
+             WHERE task_id=?1 AND iteration_id=?2 ORDER BY id ASC LIMIT 5000",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id, iteration_id], row_to_event)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
 }
 
 // ------------------------------------------------------------------
@@ -1123,6 +1629,7 @@ fn row_to_event(row: &Row<'_>) -> rusqlite::Result<TaskEvent> {
     Ok(TaskEvent {
         id: row.get("id")?,
         task_id: row.get("task_id")?,
+        iteration_id: row.get("iteration_id").unwrap_or_default(),
         subtask_id: row.get("subtask_id")?,
         kind: row.get("kind")?,
         content: row.get("content")?,
@@ -1131,10 +1638,17 @@ fn row_to_event(row: &Row<'_>) -> rusqlite::Result<TaskEvent> {
 }
 
 /// 构造只推送给前端、不落库的实时事件（日志持久化关闭时使用）。
-pub fn live_event(task_id: i64, subtask_id: Option<i64>, kind: &str, content: &str) -> TaskEvent {
+pub fn live_event(
+    task_id: i64,
+    iteration_id: i64,
+    subtask_id: Option<i64>,
+    kind: &str,
+    content: &str,
+) -> TaskEvent {
     TaskEvent {
         id: synthetic_id(),
         task_id,
+        iteration_id,
         subtask_id,
         kind: kind.to_string(),
         content: content.to_string(),
@@ -1154,21 +1668,24 @@ pub fn add_event(
         return Ok(TaskEvent {
             id: synthetic_id(),
             task_id,
+            iteration_id: current_iteration_id(conn, task_id),
             subtask_id,
             kind: kind.to_string(),
             content: content.to_string(),
             create_time,
         });
     }
+    let iteration_id = current_iteration_id(conn, task_id);
     conn.execute(
-        "INSERT INTO task_event(task_id,subtask_id,kind,content,create_time)
-         VALUES (?1,?2,?3,?4,?5)",
-        params![task_id, subtask_id, kind, content, create_time],
+        "INSERT INTO task_event(task_id,iteration_id,subtask_id,kind,content,create_time)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![task_id, iteration_id, subtask_id, kind, content, create_time],
     )
     .map_err(|e| e.to_string())?;
     Ok(TaskEvent {
         id: conn.last_insert_rowid(),
         task_id,
+        iteration_id,
         subtask_id,
         kind: kind.to_string(),
         content: content.to_string(),
@@ -1179,8 +1696,8 @@ pub fn add_event(
 pub fn list_events(conn: &Connection, task_id: i64, limit: i64) -> Result<Vec<TaskEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id,task_id,subtask_id,kind,content,create_time FROM (
-                SELECT id,task_id,subtask_id,kind,content,create_time FROM task_event
+            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM (
+                SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM task_event
                 WHERE task_id=?1 ORDER BY id DESC LIMIT ?2
              ) ORDER BY id ASC",
         )
@@ -1196,7 +1713,7 @@ pub fn list_events(conn: &Connection, task_id: i64, limit: i64) -> Result<Vec<Ta
 pub fn list_all_events(conn: &Connection, task_id: i64) -> Result<Vec<TaskEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id,task_id,subtask_id,kind,content,create_time FROM task_event
+            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM task_event
              WHERE task_id=?1 ORDER BY id ASC LIMIT 50000",
         )
         .map_err(|e| e.to_string())?;
@@ -1325,6 +1842,21 @@ pub fn update_requirements(
         params![top_requirement.trim(), accept_criteria.trim(), task_id],
     )
     .map_err(|e| e.to_string())?;
+    // 仅有一个迭代（尚未追加过需求）时，同步 dev-1.0 的需求快照。
+    let settled: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM iteration WHERE task_id=?1 AND version<>''",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if settled <= 1 {
+        conn.execute(
+            "UPDATE iteration SET requirement=?1 WHERE task_id=?2 AND version='dev-1.0'",
+            params![top_requirement.trim(), task_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())
 }
 
@@ -1427,18 +1959,20 @@ pub fn apply_followup_requirement(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
+    let iteration_id = current_iteration_id(&tx, task.id);
     for (i, (name, criteria)) in items.iter().enumerate() {
         tx.execute(
             "INSERT INTO subtask(task_id,subtask_name,sort_index,accept_criteria,assigned_coder_id,
-                current_round,max_round,status,current_stage,summary_content,summary_file_path,iteration_records,design_content)
-             VALUES (?1,?2,?3,?4,?5,0,?6,'waiting','queued','','','[]','')",
+                current_round,max_round,status,current_stage,summary_content,summary_file_path,iteration_records,design_content,iteration_id)
+             VALUES (?1,?2,?3,?4,?5,0,?6,'waiting','queued','','','[]','',?7)",
             params![
                 task.id,
                 name.trim(),
                 start + i as i64,
                 criteria,
                 first_coder,
-                task.module_max_round
+                task.module_max_round,
+                iteration_id
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1576,6 +2110,182 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM chat_message", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(n, 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn new_task_input() -> NewTaskInput {
+        NewTaskInput {
+            task_name: "迭代任务".into(),
+            top_requirement: "做一个日历".into(),
+            global_accept_criteria: "能新增日程".into(),
+            reviewer_agent_id: 1,
+            coder_agent_ids: vec![2],
+            module_max_round: 3,
+            global_max_round: 2,
+            work_dir: "/tmp/agentcrew-iter".into(),
+            manual_review_enabled: false,
+            execution_mode: "later".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: true,
+        }
+    }
+
+    /// 新建任务即登记 dev-1.0，且首个迭代处于 pending 状态。
+    #[test]
+    fn create_task_registers_dev_1_0_iteration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let task_id = create_task(&conn, &new_task_input()).unwrap();
+        let iterations = list_iterations(&conn, task_id).unwrap();
+        assert_eq!(iterations.len(), 1);
+        assert_eq!(iterations[0].version, "dev-1.0");
+        assert_eq!(iterations[0].status, "pending");
+        assert_eq!(iterations[0].requirement, "做一个日历");
+        let summary_version = list_tasks(&conn).unwrap()[0].version.clone();
+        assert_eq!(summary_version, "dev-1.0");
+    }
+
+    /// 版本号规则：默认小版本 +1；子任务超过 5 个时升大版本、小版本归零。
+    #[test]
+    fn iteration_version_rule_bumps_minor_or_major() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let task_id = create_task(&conn, &new_task_input()).unwrap();
+
+        // 第一个迭代已落定 dev-1.0，下一次默认 dev-1.1。
+        let (version, major, minor) = next_iteration_version(&conn, task_id, 1).unwrap();
+        assert_eq!((version.as_str(), major, minor), ("dev-1.1", 1, 1));
+
+        // 落定 dev-1.1 后，5 个子任务仍然是小版本。
+        let iter2 = create_iteration(&conn, task_id, "加导出".into()).unwrap();
+        settle_iteration(&conn, iter2, "dev-1.1", 1, 1).unwrap();
+        let (version, _, _) = next_iteration_version(&conn, task_id, 5).unwrap();
+        assert_eq!(version, "dev-1.2");
+
+        // 6 个子任务 -> 大版本 +1。
+        let (version, major, minor) = next_iteration_version(&conn, task_id, 6).unwrap();
+        assert_eq!((version.as_str(), major, minor), ("dev-2.0", 2, 0));
+
+        let iter3 = create_iteration(&conn, task_id, "大改造".into()).unwrap();
+        settle_iteration(&conn, iter3, "dev-2.0", 2, 0).unwrap();
+        let (version, _, _) = next_iteration_version(&conn, task_id, 1).unwrap();
+        assert_eq!(version, "dev-2.1");
+    }
+
+    /// 子任务 / 日志 / 事件写入时自动归属当前迭代，详情可按迭代隔离。
+    #[test]
+    fn records_are_scoped_to_current_iteration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let task_id = create_task(&conn, &new_task_input()).unwrap();
+        let first = current_iteration_id(&conn, task_id);
+        let ev = add_event(&conn, task_id, None, "agent_message:reviewer", "第一版").unwrap();
+        assert_eq!(ev.iteration_id, first);
+
+        let second = create_iteration(&conn, task_id, "追加需求".into()).unwrap();
+        settle_iteration(&conn, second, "dev-1.1", 1, 1).unwrap();
+        let ev2 = add_event(&conn, task_id, None, "agent_message:coder", "第二版").unwrap();
+        assert_eq!(ev2.iteration_id, second);
+
+        let detail = get_iteration_detail(&conn, task_id, first).unwrap();
+        assert_eq!(detail.execution_events.len(), 1);
+        assert_eq!(detail.execution_events[0].content, "第一版");
+        assert_eq!(detail.iterations.len(), 2);
+        let detail2 = get_iteration_detail(&conn, task_id, second).unwrap();
+        assert_eq!(detail2.execution_events[0].content, "第二版");
+    }
+
+    /// 迭代开始/结束/重开的时间与状态流转。
+    #[test]
+    fn iteration_lifecycle_tracks_time_and_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let task_id = create_task(&conn, &new_task_input()).unwrap();
+        mark_iteration_started(&conn, task_id).unwrap();
+        let it = list_iterations(&conn, task_id).unwrap().remove(0);
+        assert_eq!(it.status, "running");
+        assert!(!it.start_time.is_empty());
+
+        mark_iteration_finished(&conn, task_id, "terminated").unwrap();
+        let it = list_iterations(&conn, task_id).unwrap().remove(0);
+        assert_eq!(it.status, "terminated");
+        assert!(!it.end_time.is_empty());
+        assert!(it.duration_sec >= 0);
+
+        reopen_current_iteration(&conn, task_id).unwrap();
+        let it = list_iterations(&conn, task_id).unwrap().remove(0);
+        assert_eq!(it.status, "running");
+        assert!(it.end_time.is_empty());
+    }
+
+    /// 迁移必须把旧任务的子任务/日志归档进 dev-1.0，且重复执行无副作用。
+    #[test]
+    fn migration_backfills_legacy_task_into_dev_1_0() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("orch-iter-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orchestrator.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE task_main (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_name TEXT NOT NULL,
+                    top_requirement TEXT NOT NULL,
+                    global_accept_criteria TEXT NOT NULL,
+                    reviewer_agent_id INTEGER NOT NULL,
+                    coder_agent_ids TEXT NOT NULL,
+                    module_max_round INTEGER NOT NULL,
+                    global_max_round INTEGER NOT NULL,
+                    global_contract TEXT NOT NULL DEFAULT '',
+                    task_phase TEXT NOT NULL DEFAULT 'module_dev',
+                    status TEXT NOT NULL DEFAULT 'planning',
+                    work_dir TEXT NOT NULL,
+                    current_global_round INTEGER NOT NULL DEFAULT 0,
+                    global_review_records TEXT NOT NULL DEFAULT '[]',
+                    baseline_tree TEXT NOT NULL DEFAULT '',
+                    create_time TEXT NOT NULL
+                );
+                CREATE TABLE subtask (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    subtask_name TEXT NOT NULL,
+                    sort_index INTEGER NOT NULL,
+                    accept_criteria TEXT NOT NULL DEFAULT '',
+                    assigned_coder_id INTEGER,
+                    current_round INTEGER NOT NULL DEFAULT 0,
+                    max_round INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'waiting',
+                    current_stage TEXT NOT NULL DEFAULT 'queued',
+                    summary_content TEXT NOT NULL DEFAULT '',
+                    summary_file_path TEXT NOT NULL DEFAULT '',
+                    iteration_records TEXT NOT NULL DEFAULT '[]'
+                );
+                INSERT INTO task_main(task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
+                    coder_agent_ids,module_max_round,global_max_round,work_dir,create_time)
+                VALUES ('旧任务','旧需求','旧验收',1,'[1]',3,2,'/tmp','2026-01-01 00:00:00');
+                INSERT INTO subtask(task_id,subtask_name,sort_index,max_round)
+                VALUES (1,'旧模块',1,3);
+                "#,
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            migrate(&conn).unwrap();
+            // 幂等：再执行一次不应重复插入迭代。
+            migrate(&conn).unwrap();
+            let iterations = list_iterations(&conn, 1).unwrap();
+            assert_eq!(iterations.len(), 1);
+            assert_eq!(iterations[0].version, "dev-1.0");
+            assert_eq!(iterations[0].requirement, "旧需求");
+            assert_eq!(iterations[0].subtask_total, 1);
+            let subtask = list_subtasks(&conn, 1).unwrap().remove(0);
+            assert_eq!(subtask.iteration_id, iterations[0].id);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

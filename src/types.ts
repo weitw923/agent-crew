@@ -76,6 +76,50 @@ export interface GlobalReviewRecord {
   created_at: string;
 }
 
+/// 任务迭代（版本）：dev-1.0 / dev-1.1 / dev-2.0 …
+export type IterationStatus = "pending" | "running" | "completed" | "failed" | "terminated";
+
+export interface Iteration {
+  id: number;
+  task_id: number;
+  /** 落定后的版本号；需求梳理完成前为空字符串（界面显示“待定”）。 */
+  version: string;
+  major: number;
+  minor: number;
+  requirement: string;
+  analysis: string;
+  status: IterationStatus;
+  start_time: string;
+  end_time: string;
+  /** -1 表示尚未统计 token（当前版本只预留字段）。 */
+  token_total: number;
+  subtask_total: number;
+  subtask_completed: number;
+  /** 耗时（秒）。 */
+  duration_sec: number;
+  create_time: string;
+}
+
+/** 右侧预览面板的内容。 */
+export interface PreviewPayload {
+  kind:
+    | "design"
+    | "tech_stack"
+    | "contract"
+    | "requirement"
+    | "criteria"
+    | "diff"
+    | "summary"
+    | "review"
+    | "event"
+    | "empty";
+  title: string;
+  content: string;
+  /** 来源描述，例如「dev-1.1 · #2 模块名 · 第 2 轮」。 */
+  source?: string;
+  time?: string;
+}
+
 export interface Subtask {
   id: number;
   task_id: number;
@@ -91,6 +135,8 @@ export interface Subtask {
   summary_file_path: string;
   iteration_records: IterationRecord[];
   design_content: string;
+  /** 所属迭代 id；0 表示未归档。 */
+  iteration_id: number;
 }
 
 export interface TaskMain {
@@ -128,6 +174,7 @@ export interface TaskMain {
 export interface TaskLog {
   id: number;
   task_id: number;
+  iteration_id: number;
   level: string; // info / warn / error
   message: string;
   create_time: string;
@@ -136,6 +183,7 @@ export interface TaskLog {
 export interface TaskEvent {
   id: number;
   task_id: number;
+  iteration_id: number;
   subtask_id: number | null;
   kind: string;
   content: string;
@@ -179,6 +227,21 @@ export interface TaskDetail {
   human_messages: HumanMessage[];
   pending_plan: PendingPlan | null;
   chat_messages: ChatMessage[];
+  /** 该任务的全部迭代（按版本正序）。 */
+  iterations: Iteration[];
+}
+
+/** 单个迭代的详情视图。 */
+export interface IterationDetail {
+  task: TaskMain;
+  iteration: Iteration;
+  iterations: Iteration[];
+  subtasks: Subtask[];
+  logs: TaskLog[];
+  reviewer: AgentConfig | null;
+  coders: AgentConfig[];
+  execution_events: TaskEvent[];
+  human_messages: HumanMessage[];
 }
 
 export interface TaskSummary extends TaskMain {
@@ -186,6 +249,8 @@ export interface TaskSummary extends TaskMain {
   coder_names: string[];
   subtask_count: number;
   completed_count: number;
+  /** 当前（最新）迭代版本号。 */
+  version: string;
 }
 
 export interface NewTaskInput {

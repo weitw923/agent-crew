@@ -57,13 +57,30 @@ CREATE TABLE IF NOT EXISTS subtask (
     summary_content   TEXT NOT NULL DEFAULT '',
     summary_file_path TEXT NOT NULL DEFAULT '',
     iteration_records TEXT NOT NULL DEFAULT '[]',
-    design_content    TEXT NOT NULL DEFAULT ''
+    design_content    TEXT NOT NULL DEFAULT '',
+    iteration_id      INTEGER NOT NULL DEFAULT 0   -- 所属迭代
+);
+
+CREATE TABLE IF NOT EXISTS iteration (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    version      TEXT NOT NULL DEFAULT '',      -- dev-1.0 / dev-1.1；需求梳理完成前为空（待定）
+    major        INTEGER NOT NULL DEFAULT 0,
+    minor        INTEGER NOT NULL DEFAULT 0,
+    requirement  TEXT NOT NULL DEFAULT '',      -- 本次迭代对应的增量需求
+    analysis     TEXT NOT NULL DEFAULT '',      -- 评审对该次需求的梳理结论
+    status       TEXT NOT NULL DEFAULT 'pending', -- pending/running/completed/failed/terminated
+    start_time   TEXT NOT NULL DEFAULT '',
+    end_time     TEXT NOT NULL DEFAULT '',
+    token_total  INTEGER NOT NULL DEFAULT -1,   -- -1 = 尚未统计（预留）
+    create_time  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
     level       TEXT NOT NULL DEFAULT 'info',
+    iteration_id INTEGER NOT NULL DEFAULT 0,   -- 归属迭代
     message     TEXT NOT NULL,
     create_time TEXT NOT NULL
 );
@@ -76,6 +93,7 @@ CREATE TABLE IF NOT EXISTS app_setting (
 CREATE TABLE IF NOT EXISTS task_event (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id     INTEGER NOT NULL REFERENCES task_main(id) ON DELETE CASCADE,
+    iteration_id INTEGER NOT NULL DEFAULT 0,   -- 归属迭代
     subtask_id  INTEGER,
     kind        TEXT NOT NULL,
     content     TEXT NOT NULL,
@@ -101,5 +119,6 @@ CREATE TABLE IF NOT EXISTS chat_message (
 CREATE INDEX IF NOT EXISTS idx_subtask_task ON subtask(task_id, sort_index);
 CREATE INDEX IF NOT EXISTS idx_task_log_task ON task_log(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_task_event_task ON task_event(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_iteration_task ON iteration(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_human_message_task ON human_message(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_chat_message_task ON chat_message(task_id, id);

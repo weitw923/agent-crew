@@ -1,13 +1,14 @@
 {
   "name": "agent-crew",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "mock:ui": "vite --open /mock.html"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

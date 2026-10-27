@@ -5,6 +5,8 @@ import type {
   AppSettings,
   ChatMessage,
   FollowupMode,
+  Iteration,
+  IterationDetail,
   NewTaskInput,
   RuntimeConfigInput,
   StartOutcome,
@@ -32,6 +34,10 @@ export const appendRequirement = (
   mode: FollowupMode = "auto"
 ) => invoke<void>("append_requirement", { taskId, requirement, mode });
 export const getTaskDetail = (taskId: number) => invoke<TaskDetail>("get_task_detail", { taskId });
+export const listIterations = (taskId: number) =>
+  invoke<Iteration[]>("list_iterations", { taskId });
+export const getIterationDetail = (taskId: number, iterationId: number) =>
+  invoke<IterationDetail>("get_iteration_detail", { taskId, iterationId });
 export const listTaskEvents = (taskId: number) =>
   invoke<TaskEvent[]>("list_task_events", { taskId });
 export const deleteTask = (taskId: number) => invoke<void>("delete_task", { taskId });

@@ -325,6 +325,24 @@ fn full_serial_orchestration_flow() {
     assert!(detail.task.global_review_records.last().unwrap().passed);
     assert!(!detail.task.global_review_records[0].issues.is_empty());
 
+    // 首次任务落在 dev-1.0，完成后迭代应被归档为 completed 且有耗时。
+    assert_eq!(detail.iterations.len(), 1, "first run creates dev-1.0");
+    let first_iteration = &detail.iterations[0];
+    assert_eq!(first_iteration.version, "dev-1.0");
+    assert_eq!(first_iteration.status, "completed");
+    assert!(!first_iteration.start_time.is_empty());
+    assert!(!first_iteration.end_time.is_empty());
+    assert_eq!(first_iteration.subtask_total, 2);
+    assert_eq!(first_iteration.subtask_completed, 2);
+    assert_eq!(first_iteration.token_total, -1, "token stats not tracked yet");
+    assert!(
+        detail
+            .subtasks
+            .iter()
+            .all(|s| s.iteration_id == first_iteration.id),
+        "all subtasks belong to dev-1.0"
+    );
+
     // 第一轮代码评审被 mock 驳回 -> 第 2 轮通过；之后全局返工又把轮次重置为 1。
     let first = detail.subtasks.iter().find(|s| s.sort_index == 1).unwrap();
     assert_eq!(first.current_round, 1, "global rework resets module round");
@@ -413,6 +431,27 @@ fn full_serial_orchestration_flow() {
         "top requirement should keep follow-up history"
     );
     assert!(detail.task.followup_requirement.is_empty());
+
+    // 追加需求默认升小版本：dev-1.1，且新模块只归属该迭代。
+    assert_eq!(detail.iterations.len(), 2, "follow-up creates dev-1.1");
+    assert_eq!(detail.iterations[0].version, "dev-1.0");
+    assert_eq!(detail.iterations[1].version, "dev-1.1");
+    assert_eq!(detail.iterations[1].status, "completed");
+    assert_eq!(detail.iterations[1].subtask_total, 1);
+    assert_eq!(detail.iterations[1].subtask_completed, 1);
+    let new_module = detail
+        .subtasks
+        .iter()
+        .find(|s| s.sort_index == 3)
+        .unwrap();
+    assert_eq!(new_module.iteration_id, detail.iterations[1].id);
+    assert!(
+        detail
+            .iterations
+            .iter()
+            .all(|i| i.token_total == -1),
+        "token usage is reserved but not tracked in this version"
+    );
     let followup = detail
         .subtasks
         .iter()

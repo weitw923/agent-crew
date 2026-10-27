@@ -151,6 +151,7 @@ onUnmounted(() => unlisten?.());
         <article v-for="task in tasks" :key="task.id" class="task-card">
           <div class="title-row">
             <div class="title grow">{{ task.task_name }}</div>
+            <span class="iteration-badge">{{ task.version || "dev-?.?" }}</span>
             <span class="badge" :class="statusOf(task).cls">
               {{ statusOf(task).label }}
             </span>
@@ -164,6 +165,7 @@ onUnmounted(() => unlisten?.());
               轮次：模块 <b>{{ task.module_max_round }}</b> / 全局
               <b>{{ task.global_max_round }}</b>
             </div>
+            <div>迭代版本：<b>{{ task.version || "待定" }}</b></div>
             <div>阶段：<b>{{ phaseLabel[task.task_phase] ?? task.task_phase }}</b></div>
             <div>执行：<b>{{ modeLabel[task.execution_mode] ?? task.execution_mode }}</b></div>
             <div v-if="scheduleText(task)">窗口：<b>{{ scheduleText(task) }}</b></div>
@@ -220,6 +222,7 @@ onUnmounted(() => unlisten?.());
     <FollowUpModal
       v-if="followupTask"
       :task="followupTask"
+      :current-version="followupTask.version"
       :subtask-count="followupTask.subtask_count"
       @close="followupTask = null"
       @queued="onFollowupQueued"

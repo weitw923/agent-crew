@@ -202,6 +202,7 @@ pub fn spawn_task(app: AppHandle, task_id: i64) -> Result<(), String> {
                         ) {
                             task.status = "failed".to_string();
                             let _ = db::save_task(&conn, &task);
+                            let _ = db::mark_iteration_finished(&conn, task_id, "failed");
                         }
                         let _ = db::add_log(&conn, task_id, "error", &format!("调度终止：{err}"));
                     }
@@ -244,8 +245,13 @@ fn log(app: Option<&AppHandle>, conn: &Connection, task_id: i64, level: &str, me
     // 日志持久化关闭时，仍然把关键日志作为实时事件推送到页面。
     if !db::log_persistence() {
         if let Some(handle) = app {
-            let event =
-                db::live_event(task_id, None, "system_log", &format!("[{level}] {message}"));
+            let event = db::live_event(
+                task_id,
+                db::current_iteration_id(conn, task_id),
+                None,
+                "system_log",
+                &format!("[{level}] {message}"),
+            );
             let _ = handle.emit("task-event", json!({ "task_id": task_id, "event": event }));
         }
     }
@@ -302,6 +308,11 @@ fn run_loop(
         let conn = db::open(db_path)?;
         db::get_settings(&conn)?
     };
+    // 迭代计时：所有启动路径（人工启动 / 定时调度 / 并发排队 / 测试入口）都在这里统一开始。
+    {
+        let conn = db::open(db_path)?;
+        let _ = db::mark_iteration_started(&conn, task_id);
+    }
     // 让前端先感知到调度开始。
     emit_update(app, task_id);
 
@@ -916,6 +927,31 @@ fn do_requirement_intake(
         })
         .collect::<Vec<_>>();
 
+    // 版本号在子任务数量确定后落定：默认小版本 +1；超过 5 个子任务则升大版本。
+    // 正常入口（append_requirement）已预先登记一个「待定」迭代；若因为从旧版本
+    // 数据库继续执行而拿不到待定迭代，这里兜底补建，避免把上一个已完成的迭代改名。
+    let mut iteration_id = db::current_iteration_id(conn, task.id);
+    let needs_new_iteration = if iteration_id == 0 {
+        true
+    } else {
+        match db::get_iteration(conn, iteration_id)? {
+            Some(it) => {
+                !it.version.is_empty()
+                    || matches!(it.status.as_str(), "completed" | "terminated" | "failed")
+            }
+            None => true,
+        }
+    };
+    if needs_new_iteration {
+        iteration_id = db::create_iteration(conn, task.id, &requirement)?;
+        db::mark_iteration_started(conn, task.id)?;
+    }
+    let (version, major, minor) =
+        db::next_iteration_version(conn, task.id, items.len() as i64)?;
+    if iteration_id != 0 {
+        db::settle_iteration(conn, iteration_id, &version, major, minor)?;
+        db::set_iteration_analysis(conn, iteration_id, output.analysis.trim())?;
+    }
     record_event(
         app,
         conn,
@@ -923,13 +959,14 @@ fn do_requirement_intake(
         None,
         "agent_message:reviewer",
         &format!(
-            "追加需求梳理完成（{}）：{}\n本次新增 {} 个子任务：{}",
+            "追加需求梳理完成（{}）：{}\n本次迭代版本：{}（新增 {} 个子任务：{}）",
             if decision == "simple" {
                 "简单改动 · 单模块"
             } else {
                 "复杂需求 · 少量模块"
             },
             output.analysis.trim(),
+            version,
             items.len(),
             output
                 .subtasks
@@ -955,8 +992,9 @@ fn do_requirement_intake(
         None,
         "requirement_accepted",
         &format!(
-            "追加需求已落成 {} 个新子任务，从模块 #{} 继续串行开发；原已完成模块不会重跑。",
+            "追加需求已落成 {} 个新子任务（迭代 {}），从模块 #{} 继续串行开发；原已完成模块不会重跑。",
             items.len(),
+            version,
             new_subtasks
                 .iter()
                 .filter(|s| s.status == "waiting")
@@ -2055,6 +2093,7 @@ fn do_global_step(
     if output.passed {
         task.status = "completed".into();
         db::save_task(conn, task)?;
+        db::mark_iteration_finished(conn, task.id, "completed")?;
         log(
             app,
             conn,
@@ -3091,6 +3130,9 @@ pub fn append_requirement(
     task.start_requested = false;
     task.schedule_override = task.execution_mode == "scheduled";
     db::save_task(&conn, &task)?;
+    // 先登记一个「版本待定」的迭代：梳理完成后再落定 dev-x.y。
+    db::create_iteration(&conn, task_id, requirement)?;
+    db::mark_iteration_started(&conn, task_id)?;
     record_event(
         Some(handle),
         &conn,
@@ -3237,6 +3279,7 @@ pub fn resume_task(app: Option<&AppHandle>, task_id: i64) -> Result<(), String> 
         task.start_requested = false;
         task.schedule_override = false;
         db::save_task(&conn, &task)?;
+        db::reopen_current_iteration(&conn, task_id)?;
         log(
             Some(handle),
             &conn,
@@ -3350,6 +3393,7 @@ pub fn terminate_task(app: &AppHandle, task_id: i64) -> Result<(), String> {
     task.start_requested = false;
     task.schedule_override = false;
     db::save_task(&conn, &task)?;
+    db::mark_iteration_finished(&conn, task_id, "terminated")?;
     log(
         Some(app),
         &conn,
@@ -3462,6 +3506,7 @@ pub fn global_human_force_pass(app: Option<&AppHandle>, task_id: i64) -> Result<
     });
     task.status = "completed".into();
     db::save_task(&conn, &task)?;
+    db::mark_iteration_finished(&conn, task_id, "completed")?;
     log(
         app,
         &conn,

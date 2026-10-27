@@ -7,6 +7,8 @@ import { errorMessage, showToast } from "../toast";
 const props = defineProps<{
   task: TaskMain;
   subtaskCount?: number;
+  /** 当前最新迭代版本，用于预估本次追加后的版本号。 */
+  currentVersion?: string;
 }>();
 const emit = defineEmits<{
   (e: "close"): void;
@@ -18,6 +20,16 @@ const mode = ref<FollowupMode>("auto");
 const busy = ref(false);
 
 const charCount = computed(() => requirement.value.trim().length);
+
+/** 预估版本号：默认小版本 +1；若拆分超过 5 个子任务则升大版本。 */
+const predictedVersion = computed(() => {
+  const raw = (props.currentVersion ?? "").trim();
+  const matched = /^dev-(\d+)\.(\d+)$/.exec(raw);
+  if (!matched) return { minor: "", major: "" };
+  const major = Number(matched[1]);
+  const minor = Number(matched[2]);
+  return { minor: `dev-${major}.${minor + 1}`, major: `dev-${major + 1}.0` };
+});
 const canSubmit = computed(() => !!requirement.value.trim() && charCount.value <= 12000 && !busy.value);
 
 async function submit() {
@@ -66,6 +78,12 @@ async function submit() {
           <div class="followup-counter" :class="{ over: charCount > 12000 }">
             {{ charCount }} / 12000 · Ctrl + Enter 提交
           </div>
+        </div>
+
+        <div v-if="predictedVersion.minor" class="followup-version-tip">
+          当前版本 <b>{{ currentVersion }}</b> →
+          默认生成 <b>{{ predictedVersion.minor }}</b>；
+          若本次拆出超过 5 个子任务，将自动升为大版本 <b>{{ predictedVersion.major }}</b>。
         </div>
 
         <div class="field" style="margin-top: 14px">

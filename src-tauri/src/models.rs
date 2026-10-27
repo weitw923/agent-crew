@@ -42,6 +42,36 @@ pub struct IterationRecord {
     pub created_at: String,
 }
 
+/// 任务迭代（版本）：dev-1.0 / dev-1.1 / dev-2.0 …
+///
+/// 首次创建任务即产生 dev-1.0；之后每追加一次需求新增一个迭代，
+/// 默认小版本 +1；若该次追加拆出的子任务超过 5 个，则大版本 +1、小版本归零。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Iteration {
+    pub id: i64,
+    pub task_id: i64,
+    /// 落定后的版本号（如 dev-1.1）；需求梳理完成前为空字符串（UI 显示为待定）。
+    pub version: String,
+    pub major: i64,
+    pub minor: i64,
+    /// 该迭代对应的增量需求原文（dev-1.0 为顶层需求）。
+    pub requirement: String,
+    /// 评审对该次需求的梳理结论。
+    pub analysis: String,
+    /// pending / running / completed / failed / terminated
+    pub status: String,
+    pub start_time: String,
+    pub end_time: String,
+    /// -1 表示该迭代尚未统计 token（预留字段，界面显示“未统计”）。
+    pub token_total: i64,
+    /// 派生字段：该迭代下的子任务总数 / 已完成数。
+    pub subtask_total: i64,
+    pub subtask_completed: i64,
+    /// 派生字段：耗时（秒）；未开始时为 0。
+    pub duration_sec: i64,
+    pub create_time: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalReviewIssue {
     pub subtask_id: Option<i64>,
@@ -149,12 +179,17 @@ pub struct Subtask {
     /// 技术总监为该模块生成的详细设计文档（Coder 开工前生成）。
     #[serde(default)]
     pub design_content: String,
+    /// 所属迭代 id；0 表示尚未归档（旧数据迁移后会被归入 dev-1.0）。
+    #[serde(default)]
+    pub iteration_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskLog {
     pub id: i64,
     pub task_id: i64,
+    #[serde(default)]
+    pub iteration_id: i64,
     pub level: String,
     pub message: String,
     pub create_time: String,
@@ -182,6 +217,8 @@ pub struct PendingPlan {
 pub struct TaskEvent {
     pub id: i64,
     pub task_id: i64,
+    #[serde(default)]
+    pub iteration_id: i64,
     pub subtask_id: Option<i64>,
     pub kind: String,
     pub content: String,
@@ -222,6 +259,24 @@ pub struct TaskDetail {
     pub pending_plan: Option<PendingPlan>,
     #[serde(default)]
     pub chat_messages: Vec<ChatMessage>,
+    /// 该任务的全部迭代，按版本正序（旧的在前）。
+    #[serde(default)]
+    pub iterations: Vec<Iteration>,
+}
+
+/// 单个迭代的详情视图：只包含该迭代范围内的子任务与日志。
+#[derive(Debug, Clone, Serialize)]
+pub struct IterationDetail {
+    pub task: TaskMain,
+    pub iteration: Iteration,
+    /// 该任务全部迭代（按版本正序），供左侧迭代树切换。
+    pub iterations: Vec<Iteration>,
+    pub subtasks: Vec<Subtask>,
+    pub logs: Vec<TaskLog>,
+    pub reviewer: Option<AgentConfig>,
+    pub coders: Vec<AgentConfig>,
+    pub execution_events: Vec<TaskEvent>,
+    pub human_messages: Vec<HumanMessage>,
 }
 
 /// 列表页使用的扁平结构：TaskMain 字段 + 展示用派生字段。
@@ -233,6 +288,8 @@ pub struct TaskSummary {
     pub coder_names: Vec<String>,
     pub subtask_count: i64,
     pub completed_count: i64,
+    /// 当前（最新）迭代版本号，如 dev-1.1。
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

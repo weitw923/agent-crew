@@ -314,6 +314,7 @@ mod tests {
             summary_file_path: String::new(),
             iteration_records: Vec::new(),
             design_content: String::new(),
+            iteration_id: 0,
         };
         let dir = module_dir(root, 2, &sub);
         assert!(dir.ends_with("tasks/2/modules/03-登录---鉴权"));
