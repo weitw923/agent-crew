@@ -91,13 +91,71 @@ fn truncate_for_error(raw: &str) -> String {
     prompts::truncate_chars(raw, 1500)
 }
 
-/// 发起一次结构化 JSON 对话，返回解析后的 JSON。
+/// 一次 LLM 调用的 token 用量（OpenAI / Anthropic 统一表示）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0 && self.total_tokens == 0
+    }
+}
+
+fn usage_from_openai(value: &Value) -> Usage {
+    let usage = value.get("usage");
+    let prompt = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total = usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(prompt + completion);
+    Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+    }
+}
+
+fn usage_from_anthropic(value: &Value) -> Usage {
+    let usage = value.get("usage");
+    let prompt = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+    }
+}
+
+/// 发起一次结构化 JSON 对话，返回解析后的 JSON 与 token 用量。
 pub fn chat_json(
     agent: &AgentConfig,
     system: &str,
     user: &str,
     llm_timeout_sec: &str,
-) -> Result<Value, String> {
+) -> Result<(Value, Usage), String> {
     if agent.api_key.trim().is_empty() {
         return Err(format!("Agent「{}」未配置 apiKey", agent.name));
     }
@@ -108,15 +166,18 @@ pub fn chat_json(
         .map_err(|e| format!("创建 HTTP client 失败: {e}"))?;
 
     wait_rate_limit();
-    let first = request_once(&client, agent, system, user, true)?;
+    let (first, mut usage) = request_once(&client, agent, system, user, true)?;
     match extract_json(&first) {
-        Ok(v) => Ok(v),
+        Ok(v) => Ok((v, usage)),
         Err(first_err) => {
             // 按需求强制结构化输出：解析失败不进入业务状态，先做一次 JSON 修复重试。
             let fix_prompt = prompts::json_fix_user(user, &first);
             wait_rate_limit();
-            let second = request_once(&client, agent, system, &fix_prompt, true)?;
-            extract_json(&second).map_err(|second_err| {
+            let (second, fix_usage) = request_once(&client, agent, system, &fix_prompt, true)?;
+            usage.add(fix_usage);
+            extract_json(&second)
+                .map(|v| (v, usage))
+                .map_err(|second_err| {
                 format!(
                     "LLM 返回内容无法解析为 JSON（已自动重试一次）。首次错误: {first_err}；重试错误: {second_err}；原始片段: {}",
                     truncate_for_error(&second)
@@ -132,7 +193,7 @@ pub fn chat_text(
     system: &str,
     user: &str,
     llm_timeout_sec: &str,
-) -> Result<String, String> {
+) -> Result<(String, Usage), String> {
     if agent.api_key.trim().is_empty() {
         return Err(format!("Agent「{}」未配置 apiKey", agent.name));
     }
@@ -151,7 +212,7 @@ fn request_once(
     system: &str,
     user: &str,
     json_mode: bool,
-) -> Result<String, String> {
+) -> Result<(String, Usage), String> {
     match endpoint(agent) {
         Ok(url) => {
             if is_anthropic(&agent.provider) {
@@ -171,7 +232,7 @@ fn openai_request(
     system: &str,
     user: &str,
     json_mode: bool,
-) -> Result<String, String> {
+) -> Result<(String, Usage), String> {
     let mut body = json!({
         "model": agent.model_name,
         "temperature": agent.temperature,
@@ -221,7 +282,8 @@ fn openai_request(
     }
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("LLM 响应不是 JSON: {e}"))?;
-    content_from_openai(&value)
+    let usage = usage_from_openai(&value);
+    content_from_openai(&value).map(|content| (content, usage))
 }
 
 fn anthropic_request(
@@ -230,7 +292,7 @@ fn anthropic_request(
     url: &str,
     system: &str,
     user: &str,
-) -> Result<String, String> {
+) -> Result<(String, Usage), String> {
     let body = json!({
         "model": agent.model_name,
         "max_tokens": 8192,
@@ -251,7 +313,8 @@ fn anthropic_request(
     }
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("LLM 响应不是 JSON: {e}"))?;
-    content_from_anthropic(&value)
+    let usage = usage_from_anthropic(&value);
+    content_from_anthropic(&value).map(|content| (content, usage))
 }
 
 fn post_json(
@@ -379,6 +442,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_openai_usage() {
+        let value = json!({
+            "choices": [{ "message": { "content": "{}" } }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20 }
+        });
+        let usage = usage_from_openai(&value);
+        assert_eq!(
+            usage,
+            Usage {
+                prompt_tokens: 12,
+                completion_tokens: 8,
+                total_tokens: 20
+            }
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_usage_and_falls_back_when_missing() {
+        let value = json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": { "input_tokens": 7, "output_tokens": 3 }
+        });
+        let usage = usage_from_anthropic(&value);
+        assert_eq!(usage.total_tokens, 10);
+        let empty = usage_from_openai(&json!({ "choices": [] }));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn handles_escaped_quotes() {
         let raw = r#"{"feedback":"say \"hello\" {x}","passed":false}"#;
         let v = extract_json(raw).unwrap();
@@ -394,12 +486,12 @@ pub fn chat_json_cancellable(
     user: &str,
     llm_timeout_sec: &str,
     cancel: Arc<AtomicBool>,
-) -> Result<Value, String> {
+) -> Result<(Value, Usage), String> {
     let agent = agent.clone();
     let system = system.to_string();
     let user = user.to_string();
     let timeout = llm_timeout_sec.to_string();
-    let (tx, rx) = mpsc::channel::<Result<Value, String>>();
+    let (tx, rx) = mpsc::channel::<Result<(Value, Usage), String>>();
     std::thread::spawn(move || {
         let result = chat_json(&agent, &system, &user, &timeout);
         let _ = tx.send(result);

@@ -136,7 +136,11 @@ fn llm_json(
     let result =
         llm::chat_json_cancellable(agent, system, user, llm_timeout_sec, cancel_flag(task_id));
     match &result {
-        Ok(value) => {
+        Ok((value, usage)) => {
+            if !usage.is_empty() {
+                // 累计到当前迭代；旧迭代 token_total=-1 会从本次开始记录。
+                let _ = db::add_iteration_tokens(conn, task_id, usage.total_tokens);
+            }
             let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
             record_event(
                 app,
@@ -144,7 +148,17 @@ fn llm_json(
                 task_id,
                 subtask_id,
                 &format!("llm_response:{stage}"),
-                &pretty,
+                &format!(
+                    "{}",
+                    if usage.is_empty() {
+                        pretty
+                    } else {
+                        format!(
+                            "Token：prompt {} / completion {} / total {}\n\n{pretty}",
+                            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                        )
+                    }
+                ),
             );
         }
         Err(err) => {
@@ -158,7 +172,7 @@ fn llm_json(
             );
         }
     }
-    result
+    result.map(|(value, _)| value)
 }
 
 // ------------------------------------------------------------------
@@ -1212,6 +1226,16 @@ fn record_dsh_line(
         );
         return;
     };
+    // dsh 若在事件中上报 token 用量，一并累计到当前迭代。
+    if let Some(total) = value
+        .get("usage")
+        .and_then(|u| u.get("total_tokens").or_else(|| u.get("total")))
+        .and_then(Value::as_i64)
+    {
+        if total > 0 {
+            let _ = db::add_iteration_tokens(conn, task_id, total);
+        }
+    }
     match value.get("type").and_then(Value::as_str).unwrap_or("") {
         "text" => {
             let text = value
@@ -2757,7 +2781,12 @@ pub fn chat_with_connection(
 
     db::add_chat_message(conn, task_id, "user", content.trim())?;
     let reply = match llm::chat_text(&reviewer, &system, &user_prompt, &settings.llm_timeout_sec) {
-        Ok(text) => text,
+        Ok((text, usage)) => {
+            if !usage.is_empty() {
+                let _ = db::add_iteration_tokens(conn, task_id, usage.total_tokens);
+            }
+            text
+        }
         Err(e) => {
             let _ = db::add_log(conn, task_id, "error", &format!("临时问答调用失败：{e}"));
             return Err(format!("临时问答失败：{e}"));
@@ -2791,8 +2820,10 @@ pub fn clear_chat_messages(app: &AppHandle, task_id: i64) -> Result<(), String> 
 }
 
 /// 人工追加轮次：在保留历史记录的前提下，从当前失败阶段继续自动执行。
-pub fn extend_subtask_rounds(
-    app: &AppHandle,
+/// 追加轮次的核心状态变更（不启动调度）：UI 与无 UI 冒烟测试共用同一套逻辑。
+pub fn extend_subtask_rounds_state(
+    app: Option<&AppHandle>,
+    conn: &Connection,
     task_id: i64,
     subtask_id: i64,
     extra_rounds: i64,
@@ -2800,11 +2831,8 @@ pub fn extend_subtask_rounds(
     if !(1..=20).contains(&extra_rounds) {
         return Err("追加轮次必须是 1–20 的整数".into());
     }
-    let state = app.state::<AppState>();
-    let db_path = state.db_path()?;
-    let conn = db::open(&db_path)?;
-    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
-    let mut sub = db::get_subtask(&conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
+    let mut task = db::get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    let mut sub = db::get_subtask(conn, subtask_id)?.ok_or_else(|| "子任务不存在".to_string())?;
     if sub.task_id != task_id {
         return Err("子任务不属于该任务".into());
     }
@@ -2832,11 +2860,11 @@ pub fn extend_subtask_rounds(
     task.status = "running".into();
     task.pause_reason.clear();
     task.cancel_requested = false;
-    db::save_subtask(&conn, &sub)?;
-    db::save_task(&conn, &task)?;
+    db::save_subtask(conn, &sub)?;
+    db::save_task(conn, &task)?;
     record_event(
-        Some(app),
-        &conn,
+        app,
+        conn,
         task_id,
         Some(sub.id),
         "human_extend_rounds",
@@ -2846,8 +2874,8 @@ pub fn extend_subtask_rounds(
         ),
     );
     log(
-        Some(app),
-        &conn,
+        app,
+        conn,
         task_id,
         "warn",
         &format!(
@@ -2855,6 +2883,19 @@ pub fn extend_subtask_rounds(
             extra_rounds, sub.sort_index, sub.subtask_name, sub.current_round, sub.max_round
         ),
     );
+    Ok(())
+}
+
+pub fn extend_subtask_rounds(
+    app: &AppHandle,
+    task_id: i64,
+    subtask_id: i64,
+    extra_rounds: i64,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let db_path = state.db_path()?;
+    let conn = db::open(&db_path)?;
+    extend_subtask_rounds_state(Some(app), &conn, task_id, subtask_id, extra_rounds)?;
     drop(conn);
     if let Err(e) = spawn_task(app.clone(), task_id) {
         if let Ok(conn) = db::open(&db_path) {
@@ -3587,8 +3628,41 @@ pub fn global_human_rework(
 
 #[cfg(test)]
 mod tests {
-    use super::{should_replan, validate_intake};
+    use super::{extend_subtask_rounds_state, should_replan, validate_intake};
+    use crate::db;
+    use rusqlite::Connection;
     use serde_json::json;
+
+    /// 人工追加轮次（无 UI 入口）：校验轮次 / 阶段 / 状态推进。
+    #[test]
+    fn extend_rounds_state_moves_subtask_back_to_retry_stage() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(db::SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO task_main(task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
+                coder_agent_ids,module_max_round,global_max_round,work_dir,create_time,status)
+             VALUES ('t','r','a',1,'[2]',3,2,'/tmp','2026-01-01 00:00:00','needs_human')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO subtask(task_id,subtask_name,sort_index,max_round,status,current_stage,current_round)
+             VALUES (1,'模块',1,3,'needs_human','summary_review',3)",
+            [],
+        )
+        .unwrap();
+        extend_subtask_rounds_state(None, &conn, 1, 1, 2).unwrap();
+        let sub = db::get_subtask(&conn, 1).unwrap().unwrap();
+        assert_eq!(sub.current_round, 4);
+        assert_eq!(sub.max_round, 5);
+        assert_eq!(sub.current_stage, "summary_generation");
+        assert_eq!(sub.status, "in_progress");
+        let task = db::get_task(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "running");
+
+        // 不在待重试阶段时拒绝
+        assert!(extend_subtask_rounds_state(None, &conn, 1, 1, 1).is_err());
+    }
 
     fn intake(decision: &str, names: &[&str]) -> serde_json::Value {
         json!({

@@ -52,6 +52,31 @@ async function runScene() {
     await new Promise((r) => setTimeout(r, 400));
     return;
   }
+  if (scene === "search" || scene === "collapse" || scene === "jump") {
+    await new Promise((r) => setTimeout(r, 400));
+    if (scene === "search") {
+      const input = document.querySelector<HTMLInputElement>(".timeline-search input");
+      if (input) {
+        input.value = "导出";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      return;
+    }
+    if (scene === "collapse") {
+      clickByText(".conv-toolbar .chip", "折叠全部");
+      await new Promise((r) => setTimeout(r, 400));
+      return;
+    }
+    if (scene === "jump") {
+      // 切到有轮次记录的 dev-1.0 迭代，再跳到第 1 轮评审
+      clickByText(".iteration-node-head .link-btn", "切换");
+      await new Promise((r) => setTimeout(r, 1200));
+      clickByText(".round-chip", "第1轮");
+      await new Promise((r) => setTimeout(r, 1200));
+      return;
+    }
+  }
   if (scene === "history") {
     // 展开历史迭代 dev-1.0，再点其中带轮次记录的模块「历史」
     const nodes = Array.from(document.querySelectorAll<HTMLElement>(".iteration-node"));

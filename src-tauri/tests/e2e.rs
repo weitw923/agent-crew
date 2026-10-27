@@ -90,7 +90,8 @@ fn start_mock_llm() -> u16 {
                     "index": 0,
                     "message": { "role": "assistant", "content": content },
                     "finish_reason": "stop"
-                }]
+                }],
+                "usage": { "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150 }
             })
             .to_string();
             let resp = format!(
@@ -334,7 +335,11 @@ fn full_serial_orchestration_flow() {
     assert!(!first_iteration.end_time.is_empty());
     assert_eq!(first_iteration.subtask_total, 2);
     assert_eq!(first_iteration.subtask_completed, 2);
-    assert_eq!(first_iteration.token_total, -1, "token stats not tracked yet");
+    assert!(
+        first_iteration.token_total > 0,
+        "LLM token usage should be accumulated into the iteration (got {})",
+        first_iteration.token_total
+    );
     assert!(
         detail
             .subtasks
@@ -446,11 +451,8 @@ fn full_serial_orchestration_flow() {
         .unwrap();
     assert_eq!(new_module.iteration_id, detail.iterations[1].id);
     assert!(
-        detail
-            .iterations
-            .iter()
-            .all(|i| i.token_total == -1),
-        "token usage is reserved but not tracked in this version"
+        detail.iterations.iter().all(|i| i.token_total > 0),
+        "both iterations should track their own token usage"
     );
     let followup = detail
         .subtasks

@@ -820,11 +820,30 @@ pub fn create_iteration(
     conn.execute(
         "INSERT INTO iteration(task_id,version,major,minor,requirement,analysis,status,
             start_time,end_time,token_total,create_time)
-         VALUES (?1,'',0,0,?2,'','pending','','',-1,?3)",
+         VALUES (?1,'',0,0,?2,'','pending','','',0,?3)",
         params![task_id, requirement.trim(), create_time],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
+}
+
+/// 把一次 LLM 调用的 token 用量累计到当前迭代。
+/// `token_total = -1` 表示该迭代从未统计过（旧版本数据），首次累加会从实际值开始。
+pub fn add_iteration_tokens(conn: &Connection, task_id: i64, tokens: i64) -> Result<(), String> {
+    if tokens <= 0 {
+        return Ok(());
+    }
+    let id = current_iteration_id(conn, task_id);
+    if id == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE iteration SET token_total = CASE WHEN token_total < 0 THEN ?1 ELSE token_total + ?1 END
+         WHERE id=?2",
+        params![tokens, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 落定版本号。
@@ -1186,12 +1205,13 @@ pub fn save_subtask(conn: &Connection, subtask: &Subtask) -> Result<(), String> 
     let records = serde_json::to_string(&subtask.iteration_records)
         .map_err(|e| format!("迭代记录序列化失败: {e}"))?;
     conn.execute(
-        "UPDATE subtask SET assigned_coder_id=?1, current_round=?2, status=?3, current_stage=?4,
-            summary_content=?5, summary_file_path=?6, iteration_records=?7, design_content=?8,
-            iteration_id=?9 WHERE id=?10",
+        "UPDATE subtask SET assigned_coder_id=?1, current_round=?2, max_round=?3, status=?4,
+            current_stage=?5, summary_content=?6, summary_file_path=?7, iteration_records=?8,
+            design_content=?9, iteration_id=?10 WHERE id=?11",
         params![
             subtask.assigned_coder_id,
             subtask.current_round,
+            subtask.max_round,
             subtask.status,
             subtask.current_stage,
             subtask.summary_content,
@@ -2008,11 +2028,16 @@ pub fn set_paused(conn: &Connection, task_id: i64, message: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 日志持久化开关是进程级全局变量：涉及事件写入的用例串行执行，避免互相干扰。
+    static LOG_PERSIST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 关闭日志持久化时事件只返回给前端，不写入数据库。
     #[test]
     fn log_persistence_off_skips_event_storage() {
+        let _guard = LOG_PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute(
@@ -2177,6 +2202,8 @@ mod tests {
     /// 子任务 / 日志 / 事件写入时自动归属当前迭代，详情可按迭代隔离。
     #[test]
     fn records_are_scoped_to_current_iteration() {
+        let _guard = LOG_PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_log_persistence(true);
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         let task_id = create_task(&conn, &new_task_input()).unwrap();
@@ -2218,6 +2245,39 @@ mod tests {
         let it = list_iterations(&conn, task_id).unwrap().remove(0);
         assert_eq!(it.status, "running");
         assert!(it.end_time.is_empty());
+    }
+
+    /// token 累计：新迭代从 0 开始累加；旧迭代（-1）首次收到用量时从实际值开始。
+    #[test]
+    fn iteration_tokens_accumulate() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let task_id = create_task(&conn, &new_task_input()).unwrap();
+        let it = list_iterations(&conn, task_id).unwrap().remove(0);
+        assert_eq!(it.token_total, 0, "new iteration starts tracked at 0");
+
+        add_iteration_tokens(&conn, task_id, 120).unwrap();
+        add_iteration_tokens(&conn, task_id, 80).unwrap();
+        let it = list_iterations(&conn, task_id).unwrap().remove(0);
+        assert_eq!(it.token_total, 200);
+
+        // 模拟旧版本迭代（未统计 = -1）
+        conn.execute(
+            "UPDATE iteration SET token_total=-1 WHERE id=?1",
+            params![it.id],
+        )
+        .unwrap();
+        add_iteration_tokens(&conn, task_id, 50).unwrap();
+        let it = list_iterations(&conn, task_id).unwrap().remove(0);
+        assert_eq!(it.token_total, 50, "legacy -1 switches to real number");
+
+        // 新增迭代各自独立累计
+        let second = create_iteration(&conn, task_id, "追加需求".into()).unwrap();
+        settle_iteration(&conn, second, "dev-1.1", 1, 1).unwrap();
+        add_iteration_tokens(&conn, task_id, 30).unwrap();
+        let iterations = list_iterations(&conn, task_id).unwrap();
+        assert_eq!(iterations[0].token_total, 50);
+        assert_eq!(iterations[1].token_total, 30);
     }
 
     /// 迁移必须把旧任务的子任务/日志归档进 dev-1.0，且重复执行无副作用。

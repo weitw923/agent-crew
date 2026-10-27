@@ -220,6 +220,14 @@ const statusText = computed(() => {
   };
   return map[t.status] ?? t.status;
 });
+const currentIterationTokens = computed(() => {
+  const it = currentIteration.value;
+  if (!it || it.token_total < 0) return "未统计";
+  const total = it.token_total;
+  if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(2)}M`;
+  if (total >= 10_000) return `${(total / 1000).toFixed(1)}k`;
+  return total.toLocaleString("en-US");
+});
 const executionModeLabel = computed(() => {
   const map: Record<string, string> = {
     immediate: "立即执行",
@@ -906,6 +914,7 @@ onUnmounted(() => {
             <span v-if="scheduleText">窗口：{{ scheduleText }}</span>
             <span>人工审核：{{ task.manual_review_enabled ? "开启" : "关闭" }}</span>
             <span>轮次：{{ task.current_global_round }}/{{ task.global_max_round }}</span>
+            <span>Token：{{ currentIterationTokens }}</span>
           </div>
         </div>
         <div class="flex" style="margin-left: auto">

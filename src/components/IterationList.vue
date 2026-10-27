@@ -62,8 +62,15 @@ function progressPercent(it: Iteration) {
   return Math.round((it.subtask_completed / it.subtask_total) * 100);
 }
 
+function formatTokens(total: number) {
+  if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(2)}M`;
+  if (total >= 10_000) return `${(total / 1000).toFixed(1)}k`;
+  return total.toLocaleString("en-US");
+}
+
 function tokenText(it: Iteration) {
-  return it.token_total >= 0 ? `${it.token_total} tokens` : "未统计";
+  if (it.token_total < 0) return "未统计";
+  return `${formatTokens(it.token_total)} tokens`;
 }
 
 function toggleRequirement(id: number) {
@@ -174,7 +181,14 @@ function toggleRequirement(id: number) {
           </div>
           <div class="metric">
             <span class="metric-label">Token</span>
-            <span class="metric-value" :title="it.token_total < 0 ? '本版本尚未接入 token 统计' : ''">
+            <span
+              class="metric-value"
+              :title="
+                it.token_total < 0
+                  ? '该版本创建于 token 统计上线之前，无法回溯'
+                  : '评审 / 规划 / 摘要校验等 LLM 调用的累计用量（Coder 的 dsh 用量若上报也计入）'
+              "
+            >
               {{ tokenText(it) }}
             </span>
           </div>

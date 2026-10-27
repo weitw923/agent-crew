@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS iteration (
     status       TEXT NOT NULL DEFAULT 'pending', -- pending/running/completed/failed/terminated
     start_time   TEXT NOT NULL DEFAULT '',
     end_time     TEXT NOT NULL DEFAULT '',
-    token_total  INTEGER NOT NULL DEFAULT -1,   -- -1 = 尚未统计（预留）
+    token_total  INTEGER NOT NULL DEFAULT -1,   -- 累计 token；-1 = 统计上线前，不可回溯
     create_time  TEXT NOT NULL
 );
 
