@@ -3035,3 +3035,363 @@ html[data-theme="light"] .timeline-hit {
   overflow-x: hidden;
   min-width: 0;
 }
+
+/* ==================================================================
+   V2.5：角色类型 / 工作流编辑器
+   ================================================================== */
+.role-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  background: var(--bg-soft);
+  border-radius: 10px;
+  width: fit-content;
+  margin-bottom: 14px;
+}
+.role-tab {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.role-tab:hover {
+  color: var(--text);
+}
+.role-tab.active {
+  background: var(--panel-3);
+  border-color: var(--line);
+  color: var(--text);
+}
+.role-tab .count {
+  font-size: 10.5px;
+  color: var(--muted-2);
+  background: var(--panel-2);
+  border-radius: 99px;
+  padding: 1px 7px;
+}
+
+.agent-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 2px 2px;
+  font-size: 11px;
+}
+.agent-group-title .badge {
+  flex: 0 0 auto;
+}
+
+.role-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.role-item {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 10px 11px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  transition: 0.15s;
+}
+.role-item:hover {
+  border-color: var(--hover-line);
+}
+.role-item.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(107, 140, 255, 0.16);
+}
+.role-item .row1 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.role-item .name {
+  font-weight: 800;
+  font-size: 13px;
+}
+.role-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.role-key {
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--muted-2);
+}
+
+.capability-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.capability-card {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--bg-soft);
+  padding: 9px 10px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.capability-card:hover {
+  border-color: var(--hover-line);
+}
+.capability-card.active {
+  border-color: var(--accent);
+  background: rgba(107, 140, 255, 0.08);
+}
+.capability-card.disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.capability-card input {
+  margin-top: 3px;
+}
+.capability-card b {
+  display: block;
+  font-size: 12.5px;
+}
+.capability-card small {
+  display: block;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.55;
+  margin-top: 2px;
+}
+
+.color-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.color-swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+.color-swatch.active {
+  border-color: var(--text);
+  box-shadow: 0 0 0 2px var(--panel);
+}
+.color-swatch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------------- 工作流编辑器 ---------------- */
+.workflow-editor {
+  border: 1px solid var(--line-soft);
+  border-radius: 11px;
+  background: var(--bg-soft);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.workflow-empty {
+  color: var(--muted-2);
+  font-size: 11.5px;
+  padding: 8px 4px;
+}
+.workflow-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.workflow-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: var(--panel);
+  padding: 7px 9px;
+  min-width: 0;
+}
+.workflow-step.dragging {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(107, 140, 255, 0.28);
+  opacity: 0.92;
+}
+.workflow-steps.compact .workflow-step {
+  padding: 5px 8px;
+}
+.wf-handle {
+  cursor: grab;
+  color: var(--muted-2);
+  font-size: 13px;
+  line-height: 1;
+  user-select: none;
+  touch-action: none;
+  padding: 1px 2px;
+}
+.wf-handle:active {
+  cursor: grabbing;
+}
+body.wf-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+.wf-order {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--panel-3);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.wf-role {
+  flex: 0 0 auto;
+}
+.wf-agent {
+  font-weight: 700;
+  font-size: 12.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-caps {
+  color: var(--muted-2);
+  font-size: 10.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.wf-actions .link-btn {
+  font-size: 10.5px;
+}
+.link-btn.danger {
+  color: var(--red);
+}
+.link-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.workflow-add {
+  display: flex;
+  gap: 8px;
+}
+.workflow-add select {
+  flex: 1;
+  min-width: 0;
+}
+.workflow-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 10.5px;
+}
+.cap-chip {
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  padding: 1px 8px;
+  color: var(--muted);
+  background: var(--panel-2);
+  font-size: 10.5px;
+}
+.cap-chip.ok {
+  color: var(--green);
+  border-color: rgba(61, 220, 151, 0.35);
+  background: rgba(61, 220, 151, 0.08);
+}
+.ok-text {
+  color: var(--green);
+  font-size: 10.5px;
+}
+.workflow-error {
+  border: 1px solid rgba(255, 107, 107, 0.35);
+  background: rgba(255, 107, 107, 0.08);
+  color: var(--red);
+  border-radius: 8px;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+/* ---------------- 任务卡 / 工作台工作流简图 ---------------- */
+.task-workflow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin: 2px 0 4px;
+  min-width: 0;
+}
+.task-workflow .badge {
+  font-size: 10px;
+  padding: 2px 7px;
+}
+.wf-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.wf-name {
+  font-size: 11px;
+  color: var(--text-2);
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wf-arrow {
+  color: var(--muted-2);
+  font-size: 10.5px;
+}
+.workbench-top .meta-workflow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.wf-meta-role {
+  font-weight: 700;
+}
+.wf-meta-agent {
+  color: var(--text-2);
+}
+.wf-meta-arrow {
+  color: var(--muted-2);
+}
+.timeline-agent {
+  color: var(--muted);
+  border-left: 1px solid var(--line);
+  padding-left: 7px;
+}

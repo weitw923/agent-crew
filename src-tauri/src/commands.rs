@@ -7,8 +7,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::db;
 use crate::models::{
-    AgentConfig, AgentInput, AppSettings, ChatMessage, NewTaskInput, StartOutcome, TaskConfigInput,
-    TaskDetail, TaskMain, TaskSummary,
+    AgentConfig, AgentInput, AppSettings, ChatMessage, NewTaskInput, RoleInput, RoleType,
+    StartOutcome, TaskConfigInput, TaskDetail, TaskMain, TaskSummary,
 };
 use crate::orchestrator;
 use crate::storage;
@@ -21,6 +21,27 @@ fn ensure_not_running(app: &AppHandle, task_id: i64) -> Result<(), String> {
         return Err("任务正在执行中，请等待当前步骤结束".into());
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------
+// 角色类型（V2.5）
+// ------------------------------------------------------------------
+#[tauri::command]
+pub fn list_roles(state: State<'_, AppState>) -> Result<Vec<RoleType>, String> {
+    let conn = db::open(&state.db_path()?)?;
+    db::list_roles(&conn)
+}
+
+#[tauri::command]
+pub fn save_role(state: State<'_, AppState>, input: RoleInput) -> Result<RoleType, String> {
+    let conn = db::open(&state.db_path()?)?;
+    db::save_role(&conn, &input)
+}
+
+#[tauri::command]
+pub fn delete_role(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = db::open(&state.db_path()?)?;
+    db::delete_role(&conn, id)
 }
 
 // ------------------------------------------------------------------
@@ -79,8 +100,11 @@ pub fn import_agents(state: State<'_, AppState>, path: String) -> Result<usize, 
         let mut input: AgentInput =
             serde_json::from_value(item).map_err(|e| format!("Agent 配置字段不合法: {e}"))?;
         input.id = None;
-        if input.role_type != "reviewer" && input.role_type != "coder" {
-            return Err(format!("导入的 Agent「{}」角色类型不合法", input.name));
+        if db::get_role_by_key(&conn, input.role_type.trim())?.is_none() {
+            return Err(format!(
+                "导入的 Agent「{}」角色「{}」不存在，请先创建角色",
+                input.name, input.role_type
+            ));
         }
         db::save_agent(&conn, &input)?;
         count += 1;
@@ -100,18 +124,35 @@ pub fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSummary>, String
 #[tauri::command]
 pub fn create_task(state: State<'_, AppState>, input: NewTaskInput) -> Result<i64, String> {
     let conn = db::open(&state.db_path()?)?;
-    let reviewer = db::get_agent(&conn, input.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
-    if reviewer.role_type != "reviewer" {
-        return Err("所选评审 Agent 角色不是 reviewer".into());
-    }
-    for coder_id in &input.coder_agent_ids {
-        let coder = db::get_agent(&conn, *coder_id)?
-            .ok_or_else(|| format!("Coder Agent #{coder_id} 不存在"))?;
-        if coder.role_type != "coder" {
-            return Err(format!("Agent「{}」不是 coder 角色", coder.name));
+    // 新前端只传 workflow_agent_ids；旧调用方仍可回退到 reviewer + coders。
+    let workflow: Vec<i64> = if !input.workflow_agent_ids.is_empty() {
+        input.workflow_agent_ids.clone()
+    } else {
+        let mut ids: Vec<i64> = Vec::new();
+        if input.reviewer_agent_id > 0 {
+            ids.push(input.reviewer_agent_id);
         }
-    }
+        for id in &input.coder_agent_ids {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids
+    };
+    db::validate_workflow(&conn, &workflow)?;
+    let names: Vec<String> = workflow
+        .iter()
+        .filter_map(|id| db::get_agent(&conn, *id).ok().flatten())
+        .map(|agent| {
+            let role = if agent.role_name.trim().is_empty() {
+                agent.role_type.clone()
+            } else {
+                agent.role_name.clone()
+            };
+            format!("{}「{}」", role, agent.name)
+        })
+        .collect();
+    let workflow_label = names.join(" → ");
     let work_dir = PathBuf::from(input.work_dir.trim());
     if work_dir.as_os_str().is_empty() {
         return Err("项目本地工作目录不能为空".into());
@@ -128,8 +169,8 @@ pub fn create_task(state: State<'_, AppState>, input: NewTaskInput) -> Result<i6
         task_id,
         "info",
         &format!(
-            "任务创建：{}；评审 Agent「{}」；执行模式：{}；串行 Coder 使用列表第一个",
-            input.task_name, reviewer.name, mode_label
+            "任务创建：{}；工作流：{}；执行模式：{}",
+            input.task_name, workflow_label, mode_label
         ),
     )?;
     Ok(task_id)

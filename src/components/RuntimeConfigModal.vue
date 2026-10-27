@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { reactive, ref } from "vue";
-import type { ExecutionMode, RuntimeConfigInput, TaskMain } from "../types";
-import { showToast } from "../toast";
+import { computed, onMounted, reactive, ref } from "vue";
+import type { AgentConfig, ExecutionMode, RoleType, RuntimeConfigInput, TaskMain } from "../types";
+import { listAgents, listRoles } from "../api";
+import { capabilityText, roleBadgeStyle, validateWorkflowAgents } from "../roles";
+import { errorMessage, showToast } from "../toast";
 
 const props = defineProps<{
   task: TaskMain;
@@ -12,6 +14,60 @@ const emit = defineEmits<{
   (e: "close"): void;
   (e: "save", input: RuntimeConfigInput): void;
 }>();
+
+const agents = ref<AgentConfig[]>([]);
+const roles = ref<RoleType[]>([]);
+const workflow = ref<number[]>([...(props.task.workflow_agent_ids ?? [])]);
+const pickId = ref<number>(0);
+const editableWorkflow = computed(() => props.task.status === "pending");
+
+const agentById = computed(() => new Map(agents.value.map((a) => [a.id, a])));
+const roleByKey = computed(() => new Map(roles.value.map((r) => [r.key, r])));
+const workflowAgents = computed(() =>
+  workflow.value.map((id) => agentById.value.get(id)).filter(Boolean) as AgentConfig[]
+);
+const availableAgents = computed(() => agents.value.filter((a) => !workflow.value.includes(a.id)));
+const workflowError = computed(() =>
+  editableWorkflow.value ? validateWorkflowAgents(workflowAgents.value) : ""
+);
+
+function roleOf(agent: AgentConfig) {
+  return roleByKey.value.get(agent.role_type) ?? null;
+}
+
+function addStep() {
+  if (!pickId.value || workflow.value.includes(pickId.value) || workflow.value.length >= 6) return;
+  workflow.value.push(pickId.value);
+  pickId.value = availableAgents.value[0]?.id ?? 0;
+}
+
+function removeStep(index: number) {
+  workflow.value.splice(index, 1);
+  pickId.value = availableAgents.value[0]?.id ?? 0;
+}
+
+function moveStep(index: number, delta: number) {
+  const target = index + delta;
+  if (target < 0 || target >= workflow.value.length) return;
+  const [item] = workflow.value.splice(index, 1);
+  workflow.value.splice(target, 0, item);
+}
+
+onMounted(async () => {
+  try {
+    const [agentList, roleList] = await Promise.all([listAgents(), listRoles()]);
+    agents.value = agentList;
+    roles.value = roleList;
+    if (!workflow.value.length) {
+      workflow.value = props.task.reviewer_agent_id
+        ? [props.task.reviewer_agent_id, ...props.task.coder_agent_ids]
+        : agentList.slice(0, 2).map((a) => a.id);
+    }
+    pickId.value = availableAgents.value[0]?.id ?? 0;
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  }
+});
 
 const form = reactive<RuntimeConfigInput>({
   module_max_round: props.task.module_max_round,
@@ -36,7 +92,9 @@ function submit() {
   if (Number(form.global_max_round) < 1) return showToast("全局评审最大轮次至少为 1", "error");
   if (form.execution_mode === "scheduled" && form.schedule_start === form.schedule_end)
     return showToast("定时窗口开始与结束时间不能相同", "error");
-  emit("save", {
+  if (editableWorkflow.value && workflowError.value)
+    return showToast(workflowError.value, "error");
+  const input: RuntimeConfigInput = {
     module_max_round: Number(form.module_max_round),
     global_max_round: Number(form.global_max_round),
     manual_review_enabled: form.manual_review_enabled,
@@ -44,7 +102,11 @@ function submit() {
     schedule_start: form.schedule_start,
     schedule_end: form.schedule_end,
     schedule_enabled: form.schedule_enabled
-  });
+  };
+  if (editableWorkflow.value) {
+    input.workflow_agent_ids = [...workflow.value];
+  }
+  emit("save", input);
 }
 </script>
 
@@ -59,6 +121,57 @@ function submit() {
       <div class="modal-body">
         <div class="config-hint">
           修改后立即生效，不需要停止任务。取消不会保存任何改动。
+        </div>
+
+        <div class="config-group">
+          <div class="config-group-title">工作流</div>
+          <div v-if="!editableWorkflow" class="config-hint" style="margin-bottom: 8px">
+            任务已启动，工作流只读；如需调整请在任务运行前修改。
+          </div>
+          <div class="workflow-steps compact">
+            <div
+              v-for="(agent, index) in workflowAgents"
+              :key="agent.id"
+              class="workflow-step"
+            >
+              <span class="wf-order">{{ index + 1 }}</span>
+              <span class="badge wf-role" :style="roleBadgeStyle(roleOf(agent)?.color ?? agent.role_color)">
+                {{ roleOf(agent)?.name ?? agent.role_type }}
+              </span>
+              <span class="wf-agent">{{ agent.name }}</span>
+              <span class="wf-caps">{{ capabilityText(agent.role_capabilities) }}</span>
+              <span v-if="editableWorkflow" class="wf-actions">
+                <button class="link-btn" :disabled="index === 0" @click="moveStep(index, -1)">上移</button>
+                <button
+                  class="link-btn"
+                  :disabled="index === workflow.length - 1"
+                  @click="moveStep(index, 1)"
+                >
+                  下移
+                </button>
+                <button class="link-btn danger" @click="removeStep(index)">移除</button>
+              </span>
+            </div>
+          </div>
+          <div v-if="editableWorkflow" class="workflow-add" style="margin-top: 8px">
+            <select v-model.number="pickId" :disabled="!availableAgents.length">
+              <option v-if="!availableAgents.length" :value="0">没有可添加的 Agent</option>
+              <option v-for="agent in availableAgents" :key="agent.id" :value="agent.id">
+                {{ agent.name }}（{{ capabilityText(agent.role_capabilities) }}）
+              </option>
+            </select>
+            <button class="btn btn-sm" :disabled="!availableAgents.length || workflow.length >= 6" @click="addStep">
+              ＋ 添加步骤
+            </button>
+          </div>
+          <div v-if="editableWorkflow" class="workflow-status">
+            <span class="small muted">必需能力：</span>
+            <span class="cap-chip ok">方案设计</span>
+            <span class="cap-chip ok">编码实现</span>
+            <span class="cap-chip ok">评审验收</span>
+            <span v-if="workflowError" class="error-text">{{ workflowError }}</span>
+            <span v-else class="ok-text">✓ 可保存</span>
+          </div>
         </div>
 
         <div class="config-group">

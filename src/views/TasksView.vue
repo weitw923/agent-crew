@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import NewTaskModal from "../components/NewTaskModal.vue";
 import FollowUpModal from "../components/FollowUpModal.vue";
 import type { TaskSummary } from "../types";
+import { roleBadgeStyle } from "../roles";
 import { deleteTask, listTasks, resumeTask, startTask } from "../api";
 import { errorMessage, showToast } from "../toast";
 
@@ -140,7 +141,7 @@ onUnmounted(() => unlisten?.());
         <div class="empty-state">
           <div class="big">🗂️</div>
           <div class="title">还没有任务</div>
-          <div class="small">新建任务后，评审 Agent 会自动拆解模块并驱动 Coder 串行开发。</div>
+          <div class="small">新建任务后，工作流会按你编排的顺序自动拆解、编码与评审。</div>
           <div style="margin-top: 14px">
             <button class="btn btn-primary" @click="showNew = true">＋ 新建任务</button>
           </div>
@@ -157,10 +158,21 @@ onUnmounted(() => unlisten?.());
             </span>
           </div>
 
+          <div v-if="task.workflow?.length" class="task-workflow">
+            <template v-for="(step, index) in task.workflow.slice(0, 5)" :key="step.agent_id">
+              <span class="wf-step">
+                <span class="badge wf-badge" :style="roleBadgeStyle(step.role_color)">
+                  {{ step.role_name }}
+                </span>
+                <span class="wf-name">{{ step.agent_name }}</span>
+              </span>
+              <span v-if="index < Math.min(task.workflow.length, 5) - 1" class="wf-arrow">→</span>
+            </template>
+            <span v-if="task.workflow.length > 5" class="wf-arrow">…</span>
+          </div>
+
           <div class="task-meta">
-            <div>评审 Agent：<b>{{ task.reviewer_name }}</b></div>
             <div>子任务：<b>{{ task.completed_count }}/{{ task.subtask_count }}</b></div>
-            <div>Coder：<b>{{ task.coder_names.join("、") || "—" }}</b></div>
             <div>
               轮次：模块 <b>{{ task.module_max_round }}</b> / 全局
               <b>{{ task.global_max_round }}</b>

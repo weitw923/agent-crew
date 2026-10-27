@@ -466,6 +466,9 @@ mod tests {
             system_prompt: String::new(),
             temperature: 0.0,
             create_time: String::new(),
+            role_name: String::new(),
+            role_color: String::new(),
+            role_capabilities: Vec::new(),
         };
         let mut settings = AppSettings::default();
         settings.dsh_bin = script.to_string_lossy().to_string();

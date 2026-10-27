@@ -95,6 +95,54 @@ fn record_event(
     }
 }
 
+/// 带 Agent 归属的事件：时间线显示实际角色与名字。
+fn record_agent_event(
+    app: Option<&AppHandle>,
+    conn: &Connection,
+    task_id: i64,
+    subtask_id: Option<i64>,
+    kind: &str,
+    agent: &AgentConfig,
+    content: &str,
+) {
+    let role_name = if agent.role_name.trim().is_empty() {
+        agent.role_type.clone()
+    } else {
+        agent.role_name.clone()
+    };
+    if let Ok(event) = db::add_event_with_agent(
+        conn,
+        task_id,
+        subtask_id,
+        kind,
+        content,
+        &agent.name,
+        &role_name,
+    ) {
+        if let Some(handle) = app {
+            let _ = handle.emit("task-event", json!({ "task_id": task_id, "event": event }));
+        }
+    }
+}
+
+/// 解析子任务的 Coder：优先 assigned_coder_id（且必须属于工作流 code 能力节点）。
+fn resolve_subtask_coder(
+    conn: &Connection,
+    task: &TaskMain,
+    sub: &Subtask,
+) -> Result<AgentConfig, String> {
+    let coders = db::resolve_task_agents(conn, task, crate::models::CAP_CODE)?;
+    if let Some(id) = sub.assigned_coder_id {
+        if let Some(agent) = coders.iter().find(|a| a.id == id) {
+            return Ok(agent.clone());
+        }
+    }
+    coders
+        .into_iter()
+        .next()
+        .ok_or_else(|| "子任务未分配 Coder".to_string())
+}
+
 fn human_instructions(app: Option<&AppHandle>, conn: &Connection, task_id: i64) -> String {
     match db::consume_human_messages(conn, task_id) {
         Ok(messages) if !messages.is_empty() => {
@@ -578,11 +626,7 @@ fn do_plan(
         "info",
         "评审 Agent 开始拆解顶层需求、选择技术栈并生成全局契约…",
     );
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
-    if reviewer.role_type != "reviewer" {
-        return Err("任务绑定的 Agent 不是 Reviewer".into());
-    }
+    let planner = db::resolve_task_agent(conn, task, crate::models::CAP_PLAN)?;
 
     let human = human_instructions(app, conn, task.id);
     let base_user = prompts::planner_user(
@@ -600,14 +644,14 @@ fn do_plan(
     let mut last_error = String::new();
 
     for attempt in 0..2 {
-        let system = agent_system(&reviewer, &prompts::planner_system());
+        let system = agent_system(&planner, &prompts::planner_system());
         let value = llm_json(
             app,
             conn,
             task.id,
             None,
             "planner",
-            &reviewer,
+            &planner,
             &system,
             &user,
             &settings.llm_timeout_sec,
@@ -633,14 +677,16 @@ fn do_plan(
         }
     }
     let plan = parsed.ok_or_else(|| format!("拆解结果多次校验失败：{last_error}"))?;
-    record_event(
+    record_agent_event(
         app,
         conn,
         task.id,
         None,
         "agent_message:reviewer",
+        &planner,
         &format!(
-            "技术总监完成拆解：{} 个模块，技术栈与全局契约已生成。\n模块列表：{}",
+            "{}完成拆解：{} 个模块，技术栈与全局契约已生成。\n模块列表：{}",
+            planner.role_name,
             plan.subtasks.len(),
             plan.subtasks
                 .iter()
@@ -651,16 +697,8 @@ fn do_plan(
         ),
     );
 
-    let first_coder = task
-        .coder_agent_ids
-        .first()
-        .copied()
-        .ok_or_else(|| "任务未绑定 Coder".to_string())?;
-    let coder =
-        db::get_agent(conn, first_coder)?.ok_or_else(|| "任务绑定的 Coder 不存在".to_string())?;
-    if coder.role_type != "coder" {
-        return Err("任务绑定的 Agent 不是 Coder 角色".into());
-    }
+    // 编码能力由工作流保证，这里只做一次存在性校验。
+    let _ = db::resolve_task_agents(conn, task, crate::models::CAP_CODE)?;
 
     let pending = PendingPlan {
         tech_stack: plan.tech_stack.trim().to_string(),
@@ -836,11 +874,8 @@ fn do_requirement_intake(
     if requirement.is_empty() {
         return Err("没有待梳理的追加需求".into());
     }
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
-    if reviewer.role_type != "reviewer" {
-        return Err("任务绑定的 Agent 不是 Reviewer".into());
-    }
+    let reviewer = db::resolve_task_agent(conn, task, crate::models::CAP_REQUIREMENT)
+        .or_else(|_| db::resolve_task_agent(conn, task, crate::models::CAP_PLAN))?;
     let force_single = task.followup_mode == "single";
     log(
         app,
@@ -853,12 +888,13 @@ fn do_requirement_intake(
             "评审开始梳理追加需求：自动判断简单改动或复杂需求…"
         },
     );
-    record_event(
+    record_agent_event(
         app,
         conn,
         task.id,
         None,
         "agent_message:reviewer",
+        &reviewer,
         &format!(
             "收到追加需求：{}\n\n开始梳理增量范围；简单改动只创建 1 个子任务，不重新拆解已完成项目。",
             prompts::truncate_chars(&requirement, 3000)
@@ -966,12 +1002,13 @@ fn do_requirement_intake(
         db::settle_iteration(conn, iteration_id, &version, major, minor)?;
         db::set_iteration_analysis(conn, iteration_id, output.analysis.trim())?;
     }
-    record_event(
+    record_agent_event(
         app,
         conn,
         task.id,
         None,
         "agent_message:reviewer",
+        &reviewer,
         &format!(
             "追加需求梳理完成（{}）：{}\n本次迭代版本：{}（新增 {} 个子任务：{}）",
             if decision == "simple" {
@@ -1087,8 +1124,7 @@ fn design_generation_step(
     task: &mut TaskMain,
     sub: &mut Subtask,
 ) -> Result<(), String> {
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
+    let reviewer = db::resolve_task_agent(conn, task, crate::models::CAP_PLAN)?;
     let subtasks = db::list_subtasks(conn, task.id)?;
     let completed = db::completed_summaries(&subtasks);
     let human = human_instructions(app, conn, task.id);
@@ -1149,12 +1185,13 @@ fn design_generation_step(
             &format!("设计快照写入外部存储失败：{e}"),
         );
     }
-    record_event(
+    record_agent_event(
         app,
         conn,
         task.id,
         Some(sub.id),
         "module_design",
+        &reviewer,
         &sub.design_content,
     );
 
@@ -1209,6 +1246,7 @@ fn record_dsh_line(
     conn: &Connection,
     task_id: i64,
     subtask_id: i64,
+    agent: &AgentConfig,
     line: &str,
 ) {
     let trimmed = line.trim();
@@ -1244,12 +1282,13 @@ fn record_dsh_line(
                 .unwrap_or("")
                 .trim();
             if !text.is_empty() && text != "SUMMARY_DONE" {
-                record_event(
+                record_agent_event(
                     app,
                     conn,
                     task_id,
                     Some(subtask_id),
                     "agent_message:coder",
+                    agent,
                     text,
                 );
             }
@@ -1294,12 +1333,13 @@ fn record_dsh_line(
                 .unwrap_or("")
                 .trim();
             if !text.is_empty() && text != "SUMMARY_DONE" {
-                record_event(
+                record_agent_event(
                     app,
                     conn,
                     task_id,
                     Some(subtask_id),
                     "agent_message:coder",
+                    agent,
                     &prompts::truncate_chars(text, 5000),
                 );
             }
@@ -1326,14 +1366,7 @@ fn coder_step(
     task: &TaskMain,
     sub: &mut Subtask,
 ) -> Result<(), String> {
-    let coder_id = sub
-        .assigned_coder_id
-        .or_else(|| task.coder_agent_ids.first().copied())
-        .ok_or_else(|| "子任务未分配 Coder".to_string())?;
-    let coder = db::get_agent(conn, coder_id)?.ok_or_else(|| "Coder Agent 不存在".to_string())?;
-    if coder.role_type != "coder" {
-        return Err("子任务分配的 Agent 不是 Coder".into());
-    }
+    let coder = resolve_subtask_coder(conn, task, sub)?;
 
     let subtasks = db::list_subtasks(conn, task.id)?;
     let completed = db::completed_summaries(&subtasks);
@@ -1370,7 +1403,7 @@ fn coder_step(
     let timeout = parse_u64(&settings.dsh_timeout_sec, 1800, 30, 86_400);
     let sub_id = sub.id;
     let mut on_stdout = |line: &str| {
-        record_dsh_line(app, conn, task.id, sub_id, line);
+        record_dsh_line(app, conn, task.id, sub_id, &coder, line);
     };
     let result = dsh::run_coder(
         app_data_dir,
@@ -1428,12 +1461,13 @@ fn coder_step(
             &format!("diff 快照写入外部存储失败：{e}"),
         );
     }
-    record_event(
+    record_agent_event(
         app,
         conn,
         task.id,
         Some(sub.id),
         "git_diff",
+        &coder,
         &prompts::truncate_chars(&diff, MAX_CODE_DIFF_CHARS),
     );
     let record = crate::models::IterationRecord {
@@ -1473,8 +1507,7 @@ fn code_review_step(
     task: &mut TaskMain,
     sub: &mut Subtask,
 ) -> Result<(), String> {
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
+    let reviewer = db::resolve_task_agent(conn, task, crate::models::CAP_REVIEW)?;
     let subtasks = db::list_subtasks(conn, task.id)?;
     let completed = db::completed_summaries(&subtasks);
 
@@ -1586,11 +1619,7 @@ fn summary_generation_step(
     task: &mut TaskMain,
     sub: &mut Subtask,
 ) -> Result<(), String> {
-    let coder_id = sub
-        .assigned_coder_id
-        .or_else(|| task.coder_agent_ids.first().copied())
-        .ok_or_else(|| "子任务未分配 Coder".to_string())?;
-    let coder = db::get_agent(conn, coder_id)?.ok_or_else(|| "Coder Agent 不存在".to_string())?;
+    let coder = resolve_subtask_coder(conn, task, sub)?;
     let rel_path = dsh::summary_rel_path(sub);
     let feedback = latest_summary_feedback(sub);
     let mut current_feedback = feedback.clone();
@@ -1629,7 +1658,7 @@ fn summary_generation_step(
         let timeout = parse_u64(&settings.dsh_timeout_sec, 1800, 30, 86_400);
         let sub_id = sub.id;
         let mut on_stdout = |line: &str| {
-            record_dsh_line(app, conn, task.id, sub_id, line);
+            record_dsh_line(app, conn, task.id, sub_id, &coder, line);
         };
         let result = dsh::run_coder(
             app_data_dir,
@@ -1672,12 +1701,13 @@ fn summary_generation_step(
         summary_content =
             dsh::read_summary(Path::new(&task.work_dir), &rel_path).unwrap_or_default();
         if !summary_content.trim().is_empty() {
-            record_event(
+            record_agent_event(
                 app,
                 conn,
                 task.id,
                 Some(sub.id),
                 "summary_file",
+                &coder,
                 &summary_content,
             );
             break;
@@ -1744,8 +1774,7 @@ fn summary_review_step(
     task: &mut TaskMain,
     sub: &mut Subtask,
 ) -> Result<(), String> {
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
+    let reviewer = db::resolve_task_agent(conn, task, crate::models::CAP_REVIEW)?;
     let summary = sub
         .iteration_records
         .last()
@@ -2004,8 +2033,7 @@ fn do_global_step(
     task: &mut TaskMain,
     subtasks: &[Subtask],
 ) -> Result<(), String> {
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
+    let reviewer = db::resolve_task_agent(conn, task, crate::models::CAP_REVIEW)?;
 
     let next_round = task.current_global_round + 1;
     log(
@@ -2100,12 +2128,13 @@ fn do_global_step(
         created_at: db::now(),
     };
     task.global_review_records.push(record);
-    record_event(
+    record_agent_event(
         app,
         conn,
         task.id,
         None,
         "agent_message:reviewer",
+        &reviewer,
         &format!(
             "全局评审第 {} 轮：{}\n{}",
             task.current_global_round,
@@ -2298,12 +2327,13 @@ fn call_reviewer(
                         feedback.trim()
                     }
                 );
-                record_event(
+                record_agent_event(
                     app,
                     conn,
                     task_id,
                     subtask_id,
                     "agent_message:reviewer",
+                    reviewer,
                     &text,
                 );
                 return Ok((passed, feedback));
@@ -2747,8 +2777,9 @@ pub fn chat_with_connection(
         return Err("问题不能为空".into());
     }
     let task = db::get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
-    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
-        .ok_or_else(|| "任务绑定的技术总监 Agent 不存在".to_string())?;
+    let reviewer = db::resolve_task_agent(conn, &task, crate::models::CAP_PLAN)
+        .or_else(|_| db::resolve_task_agent(conn, &task, crate::models::CAP_REVIEW))
+        .or_else(|_| db::resolve_task_agent(conn, &task, crate::models::CAP_CODE))?;
 
     let previous = db::list_chat_messages(conn, task_id, 12)?;
     let history = previous

@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_crew_lib::db;
-use agent_crew_lib::models::{AgentInput, AppSettings, NewTaskInput};
+use agent_crew_lib::models::{AgentInput, AppSettings, NewTaskInput, RoleInput};
 use agent_crew_lib::orchestrator;
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -297,6 +297,7 @@ fn full_serial_orchestration_flow() {
             global_accept_criteria: "接口统一、可运行、摘要齐全".into(),
             reviewer_agent_id: reviewer.id,
             coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 3,
             work_dir: work_dir.to_string_lossy().to_string(),
@@ -535,6 +536,7 @@ fn manual_review_plan_and_design_gates() {
             global_accept_criteria: "接口统一".into(),
             reviewer_agent_id: reviewer.id,
             coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 3,
             work_dir: work_dir.to_string_lossy().to_string(),
@@ -632,6 +634,13 @@ fn scheduled_task_pauses_outside_window() {
     let end = (Local::now() + Duration::hours(3))
         .format("%H:%M")
         .to_string();
+    conn.execute(
+        "INSERT INTO agent_config(id,name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time)
+         VALUES (1,'R','reviewer','openai-compatible','mock','http://127.0.0.1:1/v1','k','',0.0,'2026-01-01 00:00:00'),
+                (2,'C','coder','openai-compatible','mock','http://127.0.0.1:1/v1','k','',0.0,'2026-01-01 00:00:00')",
+        [],
+    )
+    .unwrap();
     let task_id = db::create_task(
         &conn,
         &NewTaskInput {
@@ -639,7 +648,8 @@ fn scheduled_task_pauses_outside_window() {
             top_requirement: "需求".into(),
             global_accept_criteria: "验收".into(),
             reviewer_agent_id: 1,
-            coder_agent_ids: vec![1],
+            coder_agent_ids: vec![2],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 2,
             work_dir: work_dir.to_string_lossy().to_string(),
@@ -694,6 +704,21 @@ fn chat_channel_does_not_trigger_pipeline() {
         },
     )
     .unwrap();
+    let coder = db::save_agent(
+        &conn,
+        &AgentInput {
+            id: None,
+            name: "Mock Coder".into(),
+            role_type: "coder".into(),
+            provider: "openai-compatible".into(),
+            model_name: "mock-model".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "test-key".into(),
+            system_prompt: "你是编码者".into(),
+            temperature: 0.2,
+        },
+    )
+    .unwrap();
     let mut settings = AppSettings::default();
     settings.llm_timeout_sec = "15".into();
     db::save_settings(&conn, &settings).unwrap();
@@ -705,7 +730,8 @@ fn chat_channel_does_not_trigger_pipeline() {
             top_requirement: "只做问答，不开发".into(),
             global_accept_criteria: "不创建子任务".into(),
             reviewer_agent_id: reviewer.id,
-            coder_agent_ids: vec![reviewer.id],
+            coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 2,
             work_dir: work_dir.to_string_lossy().to_string(),
@@ -733,4 +759,149 @@ fn chat_channel_does_not_trigger_pipeline() {
     assert_eq!(detail.chat_messages.len(), 2);
     assert_eq!(detail.chat_messages[0].role, "user");
     assert_eq!(detail.chat_messages[1].role, "assistant");
+}
+
+/// V2.5：可扩展角色 + 线性工作流。
+/// 工作流为「产品经理（需求梳理）→ 评审者（方案/评审）→ 编码者（编码）」，
+/// 验证阶段按能力标签解析到正确的 Agent，并把 Agent/角色写入事件。
+#[test]
+fn three_role_workflow_routes_by_capability() {
+    let root = temp_dir("roles");
+    let app_data = root.join("app-data");
+    let work_dir = root.join("project");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = db::init(&app_data).unwrap();
+    let mock_dsh = write_mock_dsh(&root);
+    let port = start_mock_llm();
+
+    let conn = db::open(&db_path).unwrap();
+    let save = |name: &str, role: &str| {
+        db::save_agent(
+            &conn,
+            &AgentInput {
+                id: None,
+                name: name.into(),
+                role_type: role.into(),
+                provider: "openai-compatible".into(),
+                model_name: "mock-model".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "test-key".into(),
+                system_prompt: String::new(),
+                temperature: 0.0,
+            },
+        )
+        .unwrap()
+    };
+    // 自定义角色：只做需求梳理。
+    let pm_role = db::save_role(
+        &conn,
+        &RoleInput {
+            id: None,
+            key: "pm_e2e".into(),
+            name: "产品经理E2E".into(),
+            description: "需求梳理".into(),
+            capabilities: vec!["requirement".into()],
+            color: "#ffc857".into(),
+        },
+    )
+    .unwrap();
+    let pm = save("PM-E2E", &pm_role.key);
+    let reviewer = save("Reviewer-E2E", "reviewer");
+    let coder = save("Coder-E2E", "coder");
+
+    let mut settings = AppSettings::default();
+    settings.dsh_bin = mock_dsh.to_string_lossy().to_string();
+    settings.dsh_timeout_sec = "60".into();
+    settings.llm_timeout_sec = "15".into();
+    db::save_settings(&conn, &settings).unwrap();
+
+    let task_id = db::create_task(
+        &conn,
+        &NewTaskInput {
+            task_name: "三角色工作流".into(),
+            top_requirement: "开发一个带基础数据和业务接口的演示系统".into(),
+            global_accept_criteria: "接口统一、可运行、摘要齐全".into(),
+            reviewer_agent_id: 0,
+            coder_agent_ids: vec![],
+            workflow_agent_ids: vec![pm.id, reviewer.id, coder.id],
+            module_max_round: 3,
+            global_max_round: 3,
+            work_dir: work_dir.to_string_lossy().to_string(),
+            manual_review_enabled: false,
+            execution_mode: "immediate".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id).unwrap();
+
+    let conn = db::open(&db_path).unwrap();
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "completed");
+    assert_eq!(detail.task.workflow_agent_ids, vec![pm.id, reviewer.id, coder.id]);
+    assert_eq!(detail.workflow.len(), 3);
+    assert_eq!(detail.workflow[0].role_name, "产品经理E2E");
+    assert!(detail.roles.iter().any(|r| r.key == "pm_e2e"));
+
+    // 方案规划必须由具备 plan 能力的评审者执行，而不是第一个 Agent（产品经理）。
+    let planner_requests: Vec<&agent_crew_lib::models::TaskEvent> = detail
+        .execution_events
+        .iter()
+        .filter(|e| e.kind == "llm_request:planner")
+        .collect();
+    assert!(!planner_requests.is_empty(), "planner call expected");
+    assert!(
+        planner_requests
+            .iter()
+            .all(|e| e.content.contains("Reviewer-E2E")),
+        "planner stage should use the plan-capable agent"
+    );
+    // 代码评审事件归属评审者，编码事件归属 Coder。
+    let review_events: Vec<&agent_crew_lib::models::TaskEvent> = detail
+        .execution_events
+        .iter()
+        .filter(|e| e.kind == "agent_message:reviewer")
+        .collect();
+    assert!(
+        review_events
+            .iter()
+            .any(|e| e.agent_name == "Reviewer-E2E" && e.role_name == "评审者")
+    );
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.agent_name == "Coder-E2E" && !e.role_name.is_empty())
+    );
+
+    // 追加需求：需求梳理应由产品经理执行（具备 requirement 能力）。
+    let mut task = db::get_task(&conn, task_id).unwrap().unwrap();
+    task.followup_requirement = "给日历页增加导出当日计划为 Markdown 的按钮".into();
+    task.followup_mode = "auto".into();
+    task.task_phase = "requirement_intake".into();
+    task.status = "planning".into();
+    db::save_task(&conn, &task).unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id)
+        .expect("follow-up should finish with 3-role workflow");
+    let conn = db::open(&db_path).unwrap();
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "completed");
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.agent_name == "PM-E2E" && e.role_name == "产品经理E2E"),
+        "requirement intake should be handled by the product manager"
+    );
+    let iteration = detail.iterations.last().unwrap();
+    assert!(
+        !iteration.analysis.trim().is_empty(),
+        "product manager intake should persist analysis"
+    );
 }

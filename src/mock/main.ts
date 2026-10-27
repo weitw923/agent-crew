@@ -25,14 +25,24 @@ function clickByText(selector: string, text: string) {
 
 async function runScene() {
   await new Promise((r) => setTimeout(r, 600));
-  if (scene === "agents" || scene === "settings") {
-    clickByText(".tab-btn", scene === "agents" ? "Agent 配置" : "设置");
+  if (scene === "agents" || scene === "roles" || scene === "settings") {
+    clickByText(".tab-btn", scene === "settings" ? "设置" : "Agent 配置");
     await new Promise((r) => setTimeout(r, 700));
+    if (scene === "roles") {
+      // 切到「角色类型」页签，检查自定义角色管理 UI
+      clickByText(".role-tab", "角色类型");
+      await new Promise((r) => setTimeout(r, 400));
+    }
     return;
   }
-  if (scene === "newtask") {
+  if (scene === "newtask-workflow") {
     clickByText(".page-head .btn", "新建任务");
     await new Promise((r) => setTimeout(r, 500));
+    return;
+  }
+  if (scene === "newtask" || scene === "newtask-workflow") {
+    clickByText(".page-head .btn", "新建任务");
+    await new Promise((r) => setTimeout(r, 600));
     return;
   }
   if (!scene || scene === "tasks") return;
@@ -112,9 +122,9 @@ async function runScene() {
     await new Promise((r) => setTimeout(r, 400));
     return;
   }
-  if (scene === "config") {
+  if (scene === "config" || scene === "config-pending") {
     clickByText(".workbench-top .btn", "配置");
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 600));
   }
 }
 

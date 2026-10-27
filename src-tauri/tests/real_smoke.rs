@@ -234,6 +234,7 @@ fn real_agents_end_to_end_smoke() {
                 "存在可运行的源码文件实现 add(a, b)；README 说明用法；无第三方依赖。".into(),
             reviewer_agent_id: reviewer.id,
             coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
             module_max_round: 4,
             global_max_round: 2,
             work_dir: work_dir.to_string_lossy().to_string(),

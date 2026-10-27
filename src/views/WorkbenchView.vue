@@ -1039,8 +1039,16 @@ onUnmounted(() => {
             {{ task.task_name }}
           </div>
           <div class="meta">
-            <span>评审：{{ detail?.reviewer?.name ?? "—" }}</span>
-            <span>Coder：{{ detail?.coders.map((c) => c.name).join("、") || "—" }}</span>
+            <span v-if="detail?.workflow?.length" class="meta-workflow">
+              工作流：
+              <template v-for="(step, index) in detail.workflow" :key="step.agent_id">
+                <span class="wf-meta-role" :style="{ color: step.role_color || undefined }">
+                  {{ step.role_name }}
+                </span>
+                <span class="wf-meta-agent">{{ step.agent_name }}</span>
+                <span v-if="index < detail.workflow.length - 1" class="wf-meta-arrow">→</span>
+              </template>
+            </span>
             <span>阶段：{{ phaseLabel }}</span>
             <span>状态：{{ statusText }}</span>
             <span>执行：{{ executionModeLabel }}</span>

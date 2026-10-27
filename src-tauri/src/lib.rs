@@ -103,6 +103,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::list_roles,
+            commands::save_role,
+            commands::delete_role,
             commands::list_agents,
             commands::save_agent,
             commands::delete_agent,

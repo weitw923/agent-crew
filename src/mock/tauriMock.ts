@@ -3,13 +3,54 @@ import type {
   AgentConfig,
   Iteration,
   IterationDetail,
+  RoleType,
   TaskDetail,
   TaskEvent,
   TaskLog,
-  TaskSummary
+  TaskSummary,
+  WorkflowStep
 } from "../types";
 
 const now = "2026-10-28 04:00:00";
+
+const roles: RoleType[] = [
+  {
+    id: 1,
+    key: "reviewer",
+    name: "评审者",
+    description: "负责需求梳理、拆解方案、模块设计与评审验收。",
+    capabilities: ["requirement", "plan", "review"],
+    color: "#9b7bff",
+    is_builtin: true,
+    sort_order: 0,
+    create_time: now,
+    agent_count: 1
+  },
+  {
+    id: 2,
+    key: "coder",
+    name: "编码者",
+    description: "负责按方案实现代码。",
+    capabilities: ["code"],
+    color: "#5aa9ff",
+    is_builtin: true,
+    sort_order: 1,
+    create_time: now,
+    agent_count: 1
+  },
+  {
+    id: 3,
+    key: "product_manager",
+    name: "产品经理",
+    description: "负责需求澄清与需求文档输出，把需求交给评审者拆解。",
+    capabilities: ["requirement"],
+    color: "#ffc857",
+    is_builtin: false,
+    sort_order: 2,
+    create_time: now,
+    agent_count: 1
+  }
+];
 
 const reviewer: AgentConfig = {
   id: 1,
@@ -21,7 +62,10 @@ const reviewer: AgentConfig = {
   api_key: "",
   system_prompt: "",
   temperature: 0.3,
-  create_time: now
+  create_time: now,
+  role_name: "评审者",
+  role_color: "#9b7bff",
+  role_capabilities: ["requirement", "plan", "review"]
 };
 const coder: AgentConfig = {
   id: 2,
@@ -33,8 +77,37 @@ const coder: AgentConfig = {
   api_key: "",
   system_prompt: "",
   temperature: 0.2,
-  create_time: now
+  create_time: now,
+  role_name: "编码者",
+  role_color: "#5aa9ff",
+  role_capabilities: ["code"]
 };
+const productManager: AgentConfig = {
+  id: 3,
+  name: "产品经理小P",
+  role_type: "product_manager",
+  provider: "openai",
+  model_name: "gpt-5-codex",
+  base_url: "",
+  api_key: "",
+  system_prompt: "",
+  temperature: 0.4,
+  create_time: now,
+  role_name: "产品经理",
+  role_color: "#ffc857",
+  role_capabilities: ["requirement"]
+};
+
+const workflowIds = [3, 1, 2];
+const workflowSteps: WorkflowStep[] = [productManager, reviewer, coder].map((agent, index) => ({
+  order: index + 1,
+  agent_id: agent.id,
+  agent_name: agent.name,
+  role_key: agent.role_type,
+  role_name: agent.role_name ?? agent.role_type,
+  role_color: agent.role_color ?? "",
+  capabilities: agent.role_capabilities ?? []
+}));
 
 const iterations: Iteration[] = [
   {
@@ -342,6 +415,22 @@ const events: TaskEvent[] = [
   }
 ];
 
+// 事件归属：演示时间线里展示真实 Agent / 角色（与后端 add_event_with_agent 对齐）。
+for (const ev of events) {
+  const base = ev.kind.includes(":") ? ev.kind.slice(0, ev.kind.indexOf(":")) : ev.kind;
+  if (
+    ev.kind.startsWith("agent_message:reviewer") ||
+    base === "module_design" ||
+    base === "summary_file"
+  ) {
+    ev.agent_name = reviewer.name;
+    ev.role_name = "评审者";
+  } else if (ev.kind.startsWith("agent_message:coder") || base === "git_diff") {
+    ev.agent_name = coder.name;
+    ev.role_name = "编码者";
+  }
+}
+
 const logs: TaskLog[] = [
   { id: 1, task_id: 1, iteration_id: 11, level: "info", message: "评审 Agent 开始拆解顶层需求、选择技术栈并生成全局契约…", create_time: "2026-10-27 09:01:00" },
   { id: 2, task_id: 1, iteration_id: 11, level: "info", message: "拆解完成：共 3 个模块，等待串行开发", create_time: "2026-10-27 09:02:10" },
@@ -358,6 +447,7 @@ const taskMain = {
   global_accept_criteria: "所有日程可新增、查看、拖拽调整；导出结果为合法 Markdown；无控制台报错。",
   reviewer_agent_id: 1,
   coder_agent_ids: [2],
+  workflow_agent_ids: workflowIds,
   module_max_round: 3,
   global_max_round: 2,
   global_contract:
@@ -399,6 +489,7 @@ const summaries: TaskSummary[] = [
     ...taskMain,
     reviewer_name: reviewer.name,
     coder_names: [coder.name],
+    workflow: workflowSteps,
     subtask_count: 4,
     completed_count: 3,
     version: "dev-1.1"
@@ -435,6 +526,7 @@ const summaries: TaskSummary[] = [
     followup_mode: "auto" as const,
     reviewer_name: reviewer.name,
     coder_names: [coder.name],
+    workflow: [workflowSteps[1], workflowSteps[2]],
     subtask_count: 0,
     completed_count: 0,
     version: "dev-1.0"
@@ -464,6 +556,8 @@ function planApprovalDetail(): TaskDetail {
     logs: [],
     reviewer,
     coders: [coder],
+    workflow: workflowSteps,
+    roles,
     execution_events: [],
     human_messages: [],
     pending_plan: {
@@ -498,13 +592,17 @@ function taskDetail(iterationId: number | null): TaskDetail {
   const task =
     mockScene() === "completed"
       ? { ...taskMain, status: "completed" as const, task_phase: "module_dev" as const }
-      : taskMain;
+      : mockScene() === "pending-task" || mockScene() === "config-pending"
+        ? { ...taskMain, status: "pending" as const, task_phase: "module_dev" as const }
+        : taskMain;
   return {
     task,
     subtasks,
     logs: iterationId ? logs.filter((l) => l.iteration_id === iterationId) : logs,
     reviewer,
     coders: [coder],
+    workflow: workflowSteps,
+    roles,
     execution_events: iterationId
       ? events.filter((e) => e.iteration_id === iterationId)
       : events,
@@ -526,6 +624,8 @@ function iterationDetail(iterationId: number): IterationDetail {
       logs: [],
       reviewer,
       coders: [coder],
+      workflow: workflowSteps,
+      roles,
       execution_events: [],
       human_messages: []
     };
@@ -539,6 +639,8 @@ function iterationDetail(iterationId: number): IterationDetail {
     logs: logs.filter((l) => l.iteration_id === iterationId),
     reviewer,
     coders: [coder],
+    workflow: workflowSteps,
+    roles,
     execution_events: events.filter((e) => e.iteration_id === iterationId),
     human_messages: []
   };
@@ -551,8 +653,20 @@ export function installMock() {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
       switch (cmd) {
+        case "list_roles":
+          return roles;
+        case "save_role":
+          return { ...roles[2], ...(args.input as Record<string, unknown>) };
+        case "delete_role":
+          return null;
         case "list_agents":
-          return [reviewer, coder];
+          return [productManager, reviewer, coder];
+        case "save_agent":
+          return { ...reviewer, ...(args.input as Record<string, unknown>) };
+        case "delete_agent":
+          return null;
+        case "create_task":
+          return 1;
         case "list_tasks":
           return summaries;
         case "get_task_detail":

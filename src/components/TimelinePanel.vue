@@ -53,7 +53,14 @@ function roleOf(ev: TaskEvent): Role {
   if (base === "module_design" || base === "summary_file") return "reviewer";
   if (base === "human_message" || base === "human_message_delivered") return "human";
   if (base === "requirements_updated") return "human";
+  // 自定义角色：按事件携带的能力桶兜底（后端仍写 agent_message:reviewer / coder）。
+  if (ev.role_name) return base === "agent_message" && ev.kind.endsWith(":coder") ? "coder" : "reviewer";
   return "system";
+}
+
+/** 徽章文案优先使用事件携带的真实角色名（如「产品经理」）。 */
+function roleBadge(ev: TaskEvent) {
+  return ev.role_name?.trim() || roleLabel[roleOf(ev)];
 }
 
 const roleLabel: Record<Role, string> = {
@@ -491,10 +498,11 @@ defineExpose({ scrollToBottom });
             class="timeline-item"
             :class="roleOf(ev)"
           >
-            <div class="timeline-role" :class="roleOf(ev)">{{ roleLabel[roleOf(ev)] }}</div>
+            <div class="timeline-role" :class="roleOf(ev)">{{ roleBadge(ev) }}</div>
             <div class="timeline-body">
               <div class="timeline-meta">
                 <span class="timeline-kind">{{ kindText(ev) }}</span>
+                <span v-if="ev.agent_name" class="timeline-agent">{{ ev.agent_name }}</span>
                 <span class="timeline-time">{{ ev.create_time.slice(11) }}</span>
                 <button
                   v-if="isClickable(ev)"

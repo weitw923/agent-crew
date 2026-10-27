@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct AgentConfig {
     pub id: i64,
     pub name: String,
-    pub role_type: String, // reviewer / coder
+    pub role_type: String, // 角色 key：reviewer / coder / 自定义角色
     pub provider: String,
     pub model_name: String,
     pub base_url: String,
@@ -13,6 +13,79 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub temperature: f64,
     pub create_time: String,
+    /// 派生字段：角色展示名 / 颜色 / 能力标签（由 role_type JOIN role_type 表得到）。
+    #[serde(default)]
+    pub role_name: String,
+    #[serde(default)]
+    pub role_color: String,
+    #[serde(default)]
+    pub role_capabilities: Vec<String>,
+}
+
+/// 角色类型：能力标签 + 展示信息。内置 reviewer / coder 不允许删除。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleType {
+    pub id: i64,
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// 能力标签：requirement / plan / code / review。
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub is_builtin: bool,
+    #[serde(default)]
+    pub sort_order: i64,
+    pub create_time: String,
+    /// 派生字段：使用该角色的 Agent 数量。
+    #[serde(default)]
+    pub agent_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoleInput {
+    pub id: Option<i64>,
+    /// 自定义角色标识；为空时后端自动生成。
+    #[serde(default)]
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub color: String,
+}
+
+/// 任务工作流中的一个步骤（派生视图，不落库）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub order: i64,
+    pub agent_id: i64,
+    pub agent_name: String,
+    pub role_key: String,
+    pub role_name: String,
+    pub role_color: String,
+    pub capabilities: Vec<String>,
+}
+
+/// 能力标签常量。
+pub const CAP_REQUIREMENT: &str = "requirement";
+pub const CAP_PLAN: &str = "plan";
+pub const CAP_CODE: &str = "code";
+pub const CAP_REVIEW: &str = "review";
+
+pub fn capability_label(cap: &str) -> &'static str {
+    match cap {
+        CAP_REQUIREMENT => "需求梳理",
+        CAP_PLAN => "方案设计",
+        CAP_CODE => "编码实现",
+        CAP_REVIEW => "评审验收",
+        _ => "未知能力",
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +172,9 @@ pub struct TaskMain {
     pub global_accept_criteria: String,
     pub reviewer_agent_id: i64,
     pub coder_agent_ids: Vec<i64>,
+    /// 任务级线性工作流：按顺序排列的 Agent id。
+    #[serde(default)]
+    pub workflow_agent_ids: Vec<i64>,
     pub module_max_round: i64,
     pub global_max_round: i64,
     pub global_contract: String,
@@ -223,6 +299,11 @@ pub struct TaskEvent {
     pub kind: String,
     pub content: String,
     pub create_time: String,
+    /// 产生该事件的 Agent 展示名与角色名（系统事件为空）。
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub role_name: String,
 }
 
 /// 人工随时输入的消息，pending 状态会在下一个 Agent 步骤注入。
@@ -251,6 +332,12 @@ pub struct TaskDetail {
     pub logs: Vec<TaskLog>,
     pub reviewer: Option<AgentConfig>,
     pub coders: Vec<AgentConfig>,
+    /// 任务工作流（按顺序展开的 Agent + 角色信息）。
+    #[serde(default)]
+    pub workflow: Vec<WorkflowStep>,
+    /// 全部角色类型，供前端选择/展示。
+    #[serde(default)]
+    pub roles: Vec<RoleType>,
     #[serde(default)]
     pub execution_events: Vec<TaskEvent>,
     #[serde(default)]
@@ -275,6 +362,10 @@ pub struct IterationDetail {
     pub logs: Vec<TaskLog>,
     pub reviewer: Option<AgentConfig>,
     pub coders: Vec<AgentConfig>,
+    #[serde(default)]
+    pub workflow: Vec<WorkflowStep>,
+    #[serde(default)]
+    pub roles: Vec<RoleType>,
     pub execution_events: Vec<TaskEvent>,
     pub human_messages: Vec<HumanMessage>,
 }
@@ -286,6 +377,9 @@ pub struct TaskSummary {
     pub task: TaskMain,
     pub reviewer_name: String,
     pub coder_names: Vec<String>,
+    /// 工作流简图数据（角色徽章 + Agent 名）。
+    #[serde(default)]
+    pub workflow: Vec<WorkflowStep>,
     pub subtask_count: i64,
     pub completed_count: i64,
     /// 当前（最新）迭代版本号，如 dev-1.1。
@@ -297,8 +391,14 @@ pub struct NewTaskInput {
     pub task_name: String,
     pub top_requirement: String,
     pub global_accept_criteria: String,
+    /// 旧字段：工作流缺失时按旧逻辑兜底（兼容旧前端 / 旧数据）。
+    #[serde(default)]
     pub reviewer_agent_id: i64,
+    #[serde(default)]
     pub coder_agent_ids: Vec<i64>,
+    /// 任务级线性工作流（按顺序），新前端只传该字段。
+    #[serde(default)]
+    pub workflow_agent_ids: Vec<i64>,
     pub module_max_round: i64,
     pub global_max_round: i64,
     pub work_dir: String,
@@ -319,6 +419,9 @@ pub struct TaskConfigInput {
     pub module_max_round: i64,
     pub global_max_round: i64,
     pub manual_review_enabled: bool,
+    /// 仅任务未启动（pending）时允许修改工作流；None 表示不修改。
+    #[serde(default)]
+    pub workflow_agent_ids: Option<Vec<i64>>,
     #[serde(default = "default_execution_mode")]
     pub execution_mode: String,
     #[serde(default = "default_schedule_start")]

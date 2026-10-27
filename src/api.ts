@@ -8,6 +8,8 @@ import type {
   Iteration,
   IterationDetail,
   NewTaskInput,
+  RoleInput,
+  RoleType,
   RuntimeConfigInput,
   StartOutcome,
   TaskDetail,
@@ -15,6 +17,11 @@ import type {
   TaskMain,
   TaskSummary
 } from "./types";
+
+// ---------------- 角色类型 ----------------
+export const listRoles = () => invoke<RoleType[]>("list_roles");
+export const saveRole = (input: RoleInput) => invoke<RoleType>("save_role", { input });
+export const deleteRole = (id: number) => invoke<void>("delete_role", { id });
 
 // ---------------- Agent 配置 ----------------
 export const listAgents = () => invoke<AgentConfig[]>("list_agents");

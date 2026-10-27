@@ -7,8 +7,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::models::{
     AgentConfig, AgentInput, AppSettings, ChatMessage, GlobalReviewRecord, HumanMessage, Iteration,
-    IterationRecord, NewTaskInput, PendingPlan, Subtask, TaskConfigInput, TaskDetail, TaskEvent,
-    TaskLog, TaskMain, TaskSummary,
+    IterationRecord, NewTaskInput, PendingPlan, RoleInput, RoleType, Subtask, TaskConfigInput,
+    TaskDetail, TaskEvent, TaskLog, TaskMain, TaskSummary, WorkflowStep,
 };
 
 /// 运行日志是否持久化。关闭后事件仍会实时推送前端，但不写入数据库。
@@ -39,10 +39,22 @@ fn valid_clock(raw: &str) -> bool {
 }
 
 pub const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS role_type (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    key          TEXT NOT NULL UNIQUE,
+    name         TEXT NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    color        TEXT NOT NULL DEFAULT '',
+    is_builtin   INTEGER NOT NULL DEFAULT 0,
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    create_time  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS agent_config (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
-    role_type     TEXT NOT NULL CHECK (role_type IN ('reviewer','coder')),
+    role_type     TEXT NOT NULL,
     provider      TEXT NOT NULL DEFAULT '',
     model_name    TEXT NOT NULL DEFAULT '',
     base_url      TEXT NOT NULL DEFAULT '',
@@ -59,6 +71,7 @@ CREATE TABLE IF NOT EXISTS task_main (
     global_accept_criteria TEXT NOT NULL,
     reviewer_agent_id      INTEGER NOT NULL,
     coder_agent_ids        TEXT NOT NULL,              -- JSON: [1,2]
+    workflow_agent_ids     TEXT NOT NULL DEFAULT '',   -- JSON: [3,1,2]，按顺序的线性工作流
     module_max_round       INTEGER NOT NULL,
     global_max_round       INTEGER NOT NULL,
     global_contract        TEXT NOT NULL DEFAULT '',
@@ -139,7 +152,9 @@ CREATE TABLE IF NOT EXISTS task_event (
     subtask_id   INTEGER,
     kind         TEXT NOT NULL,
     content      TEXT NOT NULL,
-    create_time  TEXT NOT NULL
+    create_time  TEXT NOT NULL,
+    agent_name   TEXT NOT NULL DEFAULT '',
+    role_name    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS human_message (
@@ -211,7 +226,204 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Res
     Ok(())
 }
 
+/// 内置角色定义：(key, name, description, capabilities, color, sort_order)。
+pub const BUILTIN_ROLES: [(&str, &str, &str, &[&str], &str, i64); 2] = [
+    (
+        "reviewer",
+        "评审者",
+        "负责需求梳理、拆解方案、模块设计与评审验收。",
+        &["requirement", "plan", "review"],
+        "#9b7bff",
+        0,
+    ),
+    (
+        "coder",
+        "编码者",
+        "负责按方案实现代码，通过 dsh 在工作目录中写文件。",
+        &["code"],
+        "#5aa9ff",
+        1,
+    ),
+];
+
+/// V2.5：agent_config.role_type 旧表带 CHECK 约束，重建以支持任意角色 key。
+fn rebuild_agent_config_if_needed(conn: &Connection) -> Result<(), String> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_config'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(sql) = sql else {
+        return Ok(()); // 全新库由 SCHEMA 直接创建
+    };
+    if !sql.contains("CHECK (role_type IN") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE agent_config RENAME TO agent_config_v24;
+         CREATE TABLE agent_config (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             name          TEXT NOT NULL,
+             role_type     TEXT NOT NULL,
+             provider      TEXT NOT NULL DEFAULT '',
+             model_name    TEXT NOT NULL DEFAULT '',
+             base_url      TEXT NOT NULL DEFAULT '',
+             api_key       TEXT NOT NULL DEFAULT '',
+             system_prompt TEXT NOT NULL DEFAULT '',
+             temperature   REAL NOT NULL DEFAULT 0.3,
+             create_time   TEXT NOT NULL
+         );
+         INSERT INTO agent_config(id,name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time)
+             SELECT id,name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time
+             FROM agent_config_v24;
+         DROP TABLE agent_config_v24;
+         COMMIT;",
+    )
+    .map_err(|e| format!("数据库迁移失败（agent_config 角色约束）: {e}"))?;
+    Ok(())
+}
+
+/// 写入内置角色，并为历史 Agent 中出现的自定义角色 key 补登记。
+fn seed_roles(conn: &Connection) -> Result<(), String> {
+    for (key, name, description, caps, color, sort_order) in BUILTIN_ROLES {
+        let caps_json =
+            serde_json::to_string(caps).map_err(|e| format!("角色能力序列化失败: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO role_type(key,name,description,capabilities,color,is_builtin,sort_order,create_time)
+             VALUES (?1,?2,?3,?4,?5,1,?6,?7)",
+            params![key, name, description, caps_json, color, sort_order, now()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // 预置一个可删除的「产品经理」角色（仅需求梳理能力），开箱即可创建产品经理 Agent。
+    conn.execute(
+        "INSERT OR IGNORE INTO role_type(key,name,description,capabilities,color,is_builtin,sort_order,create_time)
+         VALUES ('product_manager','产品经理','负责需求澄清与需求文档输出，把需求交给评审者拆解。','[\"requirement\"]','#ffc857',0,2,?1)",
+        params![now()],
+    )
+    .map_err(|e| e.to_string())?;
+    // 历史上若出现不在角色表中的 role_type，补登记，避免 Agent 变成“未知角色”。
+    let unknown: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT a.role_type FROM agent_config a
+                 LEFT JOIN role_type r ON r.key = a.role_type WHERE r.key IS NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?
+    };
+    for key in unknown {
+        let (name, caps): (&str, Vec<&str>) = match key.as_str() {
+            "reviewer" => ("评审者", vec!["requirement", "plan", "review"]),
+            "coder" => ("编码者", vec!["code"]),
+            _ => (key.as_str(), vec![]),
+        };
+        let caps_json =
+            serde_json::to_string(&caps).map_err(|e| format!("角色能力序列化失败: {e}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO role_type(key,name,description,capabilities,color,is_builtin,sort_order,create_time)
+             VALUES (?1,?2,'',?3,'#8b97aa',0,99,?4)",
+            params![key, name, caps_json, now()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 为旧任务补齐 workflow_agent_ids（reviewer + coders 去重保序）。
+fn backfill_task_workflows(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT id, reviewer_agent_id, coder_agent_ids, workflow_agent_ids FROM task_main")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut updates: Vec<(i64, String)> = Vec::new();
+    for row in rows {
+        let (id, reviewer, coders_raw, workflow_raw) = row.map_err(|e| e.to_string())?;
+        let existing: Vec<i64> = parse_json(&workflow_raw);
+        if !existing.is_empty() {
+            continue;
+        }
+        let coders: Vec<i64> = parse_json(&coders_raw);
+        let mut ids: Vec<i64> = Vec::new();
+        if reviewer > 0 {
+            ids.push(reviewer);
+        }
+        for coder in coders {
+            if coder > 0 && !ids.contains(&coder) {
+                ids.push(coder);
+            }
+        }
+        if ids.is_empty() {
+            continue;
+        }
+        let json = serde_json::to_string(&ids).map_err(|e| format!("工作流序列化失败: {e}"))?;
+        updates.push((id, json));
+    }
+    for (id, json) in updates {
+        conn.execute(
+            "UPDATE task_main SET workflow_agent_ids=?1 WHERE id=?2",
+            params![json, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> Result<(), String> {
+    // ---- V2.5：角色类型 & 线性工作流 ----
+    rebuild_agent_config_if_needed(conn)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS role_type (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            key          TEXT NOT NULL UNIQUE,
+            name         TEXT NOT NULL,
+            description  TEXT NOT NULL DEFAULT '',
+            capabilities TEXT NOT NULL DEFAULT '[]',
+            color        TEXT NOT NULL DEFAULT '',
+            is_builtin   INTEGER NOT NULL DEFAULT 0,
+            sort_order   INTEGER NOT NULL DEFAULT 0,
+            create_time  TEXT NOT NULL
+        );",
+    )
+    .map_err(|e| e.to_string())?;
+    seed_roles(conn)?;
+    ensure_column(
+        conn,
+        "task_main",
+        "workflow_agent_ids",
+        "workflow_agent_ids TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "task_event",
+        "agent_name",
+        "agent_name TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "task_event",
+        "role_name",
+        "role_name TEXT NOT NULL DEFAULT ''",
+    )?;
+    backfill_task_workflows(conn)?;
+
     ensure_column(
         conn,
         "task_main",
@@ -391,7 +603,13 @@ fn parse_json<T: serde::de::DeserializeOwned + Default>(raw: &str) -> T {
 // ------------------------------------------------------------------
 // Agent
 // ------------------------------------------------------------------
+const AGENT_COLS: &str = "a.id,a.name,a.role_type,a.provider,a.model_name,a.base_url,a.api_key,
+    a.system_prompt,a.temperature,a.create_time,
+    COALESCE(r.name,'') AS role_name, COALESCE(r.color,'') AS role_color,
+    COALESCE(r.capabilities,'[]') AS role_capabilities";
+
 fn row_to_agent(row: &Row<'_>) -> rusqlite::Result<AgentConfig> {
+    let caps_raw: String = row.get("role_capabilities").unwrap_or_default();
     Ok(AgentConfig {
         id: row.get("id")?,
         name: row.get("name")?,
@@ -403,15 +621,19 @@ fn row_to_agent(row: &Row<'_>) -> rusqlite::Result<AgentConfig> {
         system_prompt: row.get("system_prompt")?,
         temperature: row.get("temperature")?,
         create_time: row.get("create_time")?,
+        role_name: row.get("role_name").unwrap_or_default(),
+        role_color: row.get("role_color").unwrap_or_default(),
+        role_capabilities: parse_json(&caps_raw),
     })
 }
 
 pub fn list_agents(conn: &Connection) -> Result<Vec<AgentConfig>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id,name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time
-             FROM agent_config ORDER BY CASE role_type WHEN 'reviewer' THEN 0 ELSE 1 END, id",
-        )
+        .prepare(&format!(
+            "SELECT {AGENT_COLS} FROM agent_config a
+             LEFT JOIN role_type r ON r.key = a.role_type
+             ORDER BY COALESCE(r.sort_order, 99), a.id"
+        ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], row_to_agent)
@@ -422,10 +644,10 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentConfig>, String> {
 
 pub fn get_agent(conn: &Connection, id: i64) -> Result<Option<AgentConfig>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id,name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time
-             FROM agent_config WHERE id = ?1",
-        )
+        .prepare(&format!(
+            "SELECT {AGENT_COLS} FROM agent_config a
+             LEFT JOIN role_type r ON r.key = a.role_type WHERE a.id = ?1"
+        ))
         .map_err(|e| e.to_string())?;
     let mut rows = stmt.query(params![id]).map_err(|e| e.to_string())?;
     match rows.next().map_err(|e| e.to_string())? {
@@ -438,8 +660,11 @@ pub fn save_agent(conn: &Connection, input: &AgentInput) -> Result<AgentConfig, 
     if input.name.trim().is_empty() {
         return Err("Agent 名称不能为空".into());
     }
-    if input.role_type != "reviewer" && input.role_type != "coder" {
-        return Err("角色类型必须是 reviewer 或 coder".into());
+    if input.role_type.trim().is_empty() {
+        return Err("请选择角色类型".into());
+    }
+    if get_role_by_key(conn, input.role_type.trim())?.is_none() {
+        return Err(format!("角色「{}」不存在", input.role_type));
     }
     if input.model_name.trim().is_empty() {
         return Err("model 名称不能为空".into());
@@ -491,19 +716,23 @@ pub fn save_agent(conn: &Connection, input: &AgentInput) -> Result<AgentConfig, 
 pub fn delete_agent(conn: &Connection, id: i64) -> Result<(), String> {
     // 被任务引用时禁止删除，避免历史任务显示/执行断裂。
     let mut stmt = conn
-        .prepare("SELECT reviewer_agent_id, coder_agent_ids FROM task_main")
+        .prepare(
+            "SELECT reviewer_agent_id, coder_agent_ids, workflow_agent_ids FROM task_main",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
             let reviewer: i64 = row.get(0)?;
             let coders: String = row.get(1)?;
-            Ok((reviewer, coders))
+            let workflow: String = row.get(2).unwrap_or_default();
+            Ok((reviewer, coders, workflow))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
-        let (reviewer, coders_raw) = row.map_err(|e| e.to_string())?;
+        let (reviewer, coders_raw, workflow_raw) = row.map_err(|e| e.to_string())?;
         let coders: Vec<i64> = parse_json(&coders_raw);
-        if reviewer == id || coders.contains(&id) {
+        let workflow: Vec<i64> = parse_json(&workflow_raw);
+        if reviewer == id || coders.contains(&id) || workflow.contains(&id) {
             return Err("该 Agent 已被任务引用，无法删除".into());
         }
     }
@@ -513,10 +742,358 @@ pub fn delete_agent(conn: &Connection, id: i64) -> Result<(), String> {
 }
 
 // ------------------------------------------------------------------
+// 角色类型（V2.5）
+// ------------------------------------------------------------------
+const ROLE_COLS: &str = "r.id,r.key,r.name,r.description,r.capabilities,r.color,
+    r.is_builtin,r.sort_order,r.create_time";
+
+fn row_to_role(row: &Row<'_>) -> rusqlite::Result<RoleType> {
+    let caps_raw: String = row.get("capabilities").unwrap_or_default();
+    Ok(RoleType {
+        id: row.get("id")?,
+        key: row.get("key")?,
+        name: row.get("name")?,
+        description: row.get("description").unwrap_or_default(),
+        capabilities: parse_json(&caps_raw),
+        color: row.get("color").unwrap_or_default(),
+        is_builtin: row.get::<_, i64>("is_builtin").unwrap_or(0) != 0,
+        sort_order: row.get::<_, i64>("sort_order").unwrap_or(0),
+        create_time: row.get("create_time")?,
+        agent_count: 0,
+    })
+}
+
+pub fn list_roles(conn: &Connection) -> Result<Vec<RoleType>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ROLE_COLS}, (SELECT COUNT(*) FROM agent_config a WHERE a.role_type=r.key) AS agent_count
+             FROM role_type r ORDER BY r.is_builtin DESC, r.sort_order, r.id"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let mut role = row_to_role(row)?;
+            role.agent_count = row.get("agent_count").unwrap_or(0);
+            Ok(role)
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn get_role(conn: &Connection, id: i64) -> Result<Option<RoleType>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ROLE_COLS}, (SELECT COUNT(*) FROM agent_config a WHERE a.role_type=r.key) AS agent_count
+             FROM role_type r WHERE r.id=?1"
+        ))
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![id]).map_err(|e| e.to_string())?;
+    match rows.next().map_err(|e| e.to_string())? {
+        Some(row) => {
+            let mut role = row_to_role(row).map_err(|e| e.to_string())?;
+            role.agent_count = row.get("agent_count").unwrap_or(0);
+            Ok(Some(role))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn get_role_by_key(conn: &Connection, key: &str) -> Result<Option<RoleType>, String> {
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM role_type WHERE key=?1",
+            params![key.trim()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match id {
+        Some(id) => get_role(conn, id),
+        None => Ok(None),
+    }
+}
+
+fn role_key_from_name(name: &str, seq: i64) -> String {
+    let mut key: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    key = key.trim_matches('_').to_string();
+    if key.is_empty() || !key.chars().next().unwrap().is_ascii_alphabetic() {
+        key = format!("role_{seq}");
+    }
+    key
+}
+
+fn validate_capabilities(caps: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for cap in caps {
+        let cap = cap.trim();
+        if !matches!(
+            cap,
+            crate::models::CAP_REQUIREMENT
+                | crate::models::CAP_PLAN
+                | crate::models::CAP_CODE
+                | crate::models::CAP_REVIEW
+        ) {
+            return Err(format!("未知能力标签：{cap}"));
+        }
+        if !out.iter().any(|c| c == cap) {
+            out.push(cap.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("角色至少需要 1 个能力标签".into());
+    }
+    Ok(out)
+}
+
+pub fn save_role(conn: &Connection, input: &RoleInput) -> Result<RoleType, String> {
+    if input.name.trim().is_empty() {
+        return Err("角色名称不能为空".into());
+    }
+    let capabilities = validate_capabilities(&input.capabilities)?;
+    let caps_json =
+        serde_json::to_string(&capabilities).map_err(|e| format!("角色能力序列化失败: {e}"))?;
+    let color = input.color.trim();
+    if let Some(id) = input.id {
+        let current = get_role(conn, id)?.ok_or_else(|| "角色不存在".to_string())?;
+        if current.is_builtin {
+            // 内置角色只允许补充说明，能力与标识不可改。
+            conn.execute(
+                "UPDATE role_type SET description=?1 WHERE id=?2",
+                params![input.description.trim(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            conn.execute(
+                "UPDATE role_type SET name=?1, description=?2, capabilities=?3, color=?4 WHERE id=?5",
+                params![
+                    input.name.trim(),
+                    input.description.trim(),
+                    caps_json,
+                    color,
+                    id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        get_role(conn, id)?.ok_or_else(|| "角色不存在".to_string())
+    } else {
+        let key = if input.key.trim().is_empty() {
+            let seq: i64 = conn
+                .query_row("SELECT COALESCE(MAX(id),0)+1 FROM role_type", [], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            role_key_from_name(&input.name, seq)
+        } else {
+            input.key.trim().to_lowercase()
+        };
+        if key.len() < 2 || key.len() > 32 {
+            return Err("角色标识长度必须是 2-32 个字符".into());
+        }
+        if !key
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || (c == '_' && i > 0))
+        {
+            return Err("角色标识只能包含小写字母、数字和下划线，且以字母开头".into());
+        }
+        if get_role_by_key(conn, &key)?.is_some() {
+            return Err(format!("角色标识「{key}」已存在"));
+        }
+        let sort_order: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order),0)+1 FROM role_type",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO role_type(key,name,description,capabilities,color,is_builtin,sort_order,create_time)
+             VALUES (?1,?2,?3,?4,?5,0,?6,?7)",
+            params![
+                key,
+                input.name.trim(),
+                input.description.trim(),
+                caps_json,
+                color,
+                sort_order,
+                now()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        get_role(conn, conn.last_insert_rowid())?.ok_or_else(|| "角色创建失败".to_string())
+    }
+}
+
+pub fn delete_role(conn: &Connection, id: i64) -> Result<(), String> {
+    let role = get_role(conn, id)?.ok_or_else(|| "角色不存在".to_string())?;
+    if role.is_builtin {
+        return Err(format!("「{}」是内置角色，不能删除", role.name));
+    }
+    if role.agent_count > 0 {
+        return Err(format!(
+            "仍有 {} 个 Agent 使用「{}」，请先改为其它角色",
+            role.agent_count, role.name
+        ));
+    }
+    conn.execute("DELETE FROM role_type WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 角色能力标签（role 表缺失时按内置角色兜底）。
+pub fn role_capabilities(conn: &Connection, key: &str) -> Vec<String> {
+    if let Ok(Some(role)) = get_role_by_key(conn, key) {
+        return role.capabilities;
+    }
+    match key {
+        "reviewer" => vec![
+            crate::models::CAP_REQUIREMENT.into(),
+            crate::models::CAP_PLAN.into(),
+            crate::models::CAP_REVIEW.into(),
+        ],
+        "coder" => vec![crate::models::CAP_CODE.into()],
+        _ => Vec::new(),
+    }
+}
+
+/// 任务实际生效的工作流 Agent id 列表（旧任务回退到 reviewer + coders）。
+pub fn task_workflow_ids(task: &TaskMain) -> Vec<i64> {
+    if !task.workflow_agent_ids.is_empty() {
+        return task.workflow_agent_ids.clone();
+    }
+    let mut ids: Vec<i64> = Vec::new();
+    if task.reviewer_agent_id > 0 {
+        ids.push(task.reviewer_agent_id);
+    }
+    for id in &task.coder_agent_ids {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    ids
+}
+
+/// 工作流展开为带角色信息的步骤视图。
+pub fn workflow_steps(conn: &Connection, task: &TaskMain) -> Vec<WorkflowStep> {
+    let mut out = Vec::new();
+    for (idx, agent_id) in task_workflow_ids(task).into_iter().enumerate() {
+        let Ok(Some(agent)) = get_agent(conn, agent_id) else {
+            continue;
+        };
+        out.push(WorkflowStep {
+            order: (idx + 1) as i64,
+            agent_id: agent.id,
+            agent_name: agent.name.clone(),
+            role_key: agent.role_type.clone(),
+            role_name: if agent.role_name.is_empty() {
+                agent.role_type.clone()
+            } else {
+                agent.role_name.clone()
+            },
+            role_color: agent.role_color.clone(),
+            capabilities: agent.role_capabilities.clone(),
+        });
+    }
+    out
+}
+
+/// 校验工作流：2-6 步、不重复、Agent 存在、必须覆盖 plan / code / review 三种能力。
+pub fn validate_workflow(conn: &Connection, ids: &[i64]) -> Result<(), String> {
+    if ids.len() < 2 {
+        return Err("工作流至少需要 2 个 Agent（例如 评审者 → 编码者）".into());
+    }
+    if ids.len() > 6 {
+        return Err("工作流最多支持 6 个 Agent".into());
+    }
+    let mut seen: Vec<i64> = Vec::new();
+    let mut caps: Vec<String> = Vec::new();
+    for id in ids {
+        if seen.contains(id) {
+            return Err(format!("Agent #{id} 在工作流中重复出现"));
+        }
+        seen.push(*id);
+        let agent = get_agent(conn, *id)?
+            .ok_or_else(|| format!("工作流中的 Agent #{id} 不存在"))?;
+        for cap in &agent.role_capabilities {
+            if !caps.contains(cap) {
+                caps.push(cap.clone());
+            }
+        }
+    }
+    for cap in [
+        crate::models::CAP_PLAN,
+        crate::models::CAP_CODE,
+        crate::models::CAP_REVIEW,
+    ] {
+        if !caps.iter().any(|c| c == cap) {
+            return Err(format!(
+                "工作流缺少「{}」能力的 Agent",
+                crate::models::capability_label(cap)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 按能力在工作流中解析第一个匹配的 Agent。
+pub fn resolve_task_agent(
+    conn: &Connection,
+    task: &TaskMain,
+    capability: &str,
+) -> Result<AgentConfig, String> {
+    for id in task_workflow_ids(task) {
+        if let Some(agent) = get_agent(conn, id)? {
+            if agent.role_capabilities.iter().any(|c| c == capability) {
+                return Ok(agent);
+            }
+        }
+    }
+    Err(format!(
+        "任务工作流中没有具备「{}」能力的 Agent",
+        crate::models::capability_label(capability)
+    ))
+}
+
+/// 按能力解析工作流中所有匹配的 Agent（编码阶段用于轮换分配）。
+pub fn resolve_task_agents(
+    conn: &Connection,
+    task: &TaskMain,
+    capability: &str,
+) -> Result<Vec<AgentConfig>, String> {
+    let mut out = Vec::new();
+    for id in task_workflow_ids(task) {
+        if let Some(agent) = get_agent(conn, id)? {
+            if agent.role_capabilities.iter().any(|c| c == capability) {
+                out.push(agent);
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "任务工作流中没有具备「{}」能力的 Agent",
+            crate::models::capability_label(capability)
+        ));
+    }
+    Ok(out)
+}
+
+// ------------------------------------------------------------------
 // Task
 // ------------------------------------------------------------------
 fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskMain> {
     let coders_raw: String = row.get("coder_agent_ids")?;
+    let workflow_raw: String = row.get("workflow_agent_ids").unwrap_or_default();
     let records_raw: String = row.get("global_review_records")?;
     Ok(TaskMain {
         id: row.get("id")?,
@@ -525,6 +1102,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskMain> {
         global_accept_criteria: row.get("global_accept_criteria")?,
         reviewer_agent_id: row.get("reviewer_agent_id")?,
         coder_agent_ids: parse_json(&coders_raw),
+        workflow_agent_ids: parse_json(&workflow_raw),
         module_max_round: row.get("module_max_round")?,
         global_max_round: row.get("global_max_round")?,
         global_contract: row.get("global_contract")?,
@@ -561,7 +1139,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskMain> {
 }
 
 const TASK_COLS: &str = "id,task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
-    coder_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,work_dir,
+    coder_agent_ids,workflow_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,work_dir,
     current_global_round,global_review_records,baseline_tree,manual_review_enabled,tech_stack,
     pending_plan_json,cancel_requested,execution_mode,schedule_start,schedule_end,schedule_enabled,
     schedule_override,start_requested,pause_reason,followup_requirement,followup_mode,
@@ -578,21 +1156,41 @@ pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
     let mut out = Vec::new();
     for row in rows {
         let task = row.map_err(|e| e.to_string())?;
-        let reviewer_name = agents
+        let workflow_ids = task_workflow_ids(&task);
+        let workflow: Vec<WorkflowStep> = workflow_ids
             .iter()
-            .find(|a| a.id == task.reviewer_agent_id)
-            .map(|a| a.name.clone())
-            .unwrap_or_else(|| "（已删除）".into());
-        let coder_names = task
-            .coder_agent_ids
-            .iter()
-            .map(|id| {
-                agents
-                    .iter()
-                    .find(|a| a.id == *id)
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| format!("（已删除#{id}）"))
+            .enumerate()
+            .filter_map(|(idx, id)| {
+                agents.iter().find(|a| a.id == *id).map(|a| WorkflowStep {
+                    order: (idx + 1) as i64,
+                    agent_id: a.id,
+                    agent_name: a.name.clone(),
+                    role_key: a.role_type.clone(),
+                    role_name: if a.role_name.is_empty() {
+                        a.role_type.clone()
+                    } else {
+                        a.role_name.clone()
+                    },
+                    role_color: a.role_color.clone(),
+                    capabilities: a.role_capabilities.clone(),
+                })
             })
+            .collect();
+        let reviewer_name = workflow
+            .iter()
+            .find(|w| w.capabilities.iter().any(|c| c == "plan"))
+            .or_else(|| {
+                workflow
+                    .iter()
+                    .find(|w| w.capabilities.iter().any(|c| c == "review"))
+            })
+            .or_else(|| workflow.first())
+            .map(|w| w.agent_name.clone())
+            .unwrap_or_else(|| "（已删除）".into());
+        let coder_names = workflow
+            .iter()
+            .filter(|w| w.capabilities.iter().any(|c| c == "code"))
+            .map(|w| w.agent_name.clone())
             .collect::<Vec<_>>();
         let (subtask_count, completed_count) = subtask_counts(conn, task.id)?;
         let version = conn
@@ -609,6 +1207,7 @@ pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
             task,
             reviewer_name,
             coder_names,
+            workflow,
             subtask_count,
             completed_count,
             version,
@@ -646,6 +1245,57 @@ pub fn get_task(conn: &Connection, id: i64) -> Result<Option<TaskMain>, String> 
     }
 }
 
+/// 依据工作流推导旧的 reviewer_agent_id / coder_agent_ids（回滚兼容）。
+fn derive_legacy_bindings(
+    conn: &Connection,
+    workflow: &[i64],
+) -> Result<(i64, Vec<i64>), String> {
+    let mut reviewer = 0i64;
+    let mut coders: Vec<i64> = Vec::new();
+    let mut review_fallback = 0i64;
+    for id in workflow {
+        if let Some(agent) = get_agent(conn, *id)? {
+            let caps = &agent.role_capabilities;
+            if reviewer == 0 && caps.iter().any(|c| c == crate::models::CAP_PLAN) {
+                reviewer = *id;
+            }
+            if review_fallback == 0 && caps.iter().any(|c| c == crate::models::CAP_REVIEW) {
+                review_fallback = *id;
+            }
+            if caps.iter().any(|c| c == crate::models::CAP_CODE) {
+                coders.push(*id);
+            }
+        }
+    }
+    if reviewer == 0 {
+        reviewer = review_fallback;
+    }
+    if reviewer == 0 {
+        reviewer = *workflow.first().ok_or_else(|| "工作流不能为空".to_string())?;
+    }
+    Ok((reviewer, coders))
+}
+
+/// 持久化任务工作流，并同步旧的 reviewer / coder 字段。
+pub fn save_task_workflow(
+    conn: &Connection,
+    task_id: i64,
+    workflow: &[i64],
+) -> Result<(), String> {
+    validate_workflow(conn, workflow)?;
+    let (reviewer, coders) = derive_legacy_bindings(conn, workflow)?;
+    let workflow_json = serde_json::to_string(workflow)
+        .map_err(|e| format!("工作流序列化失败: {e}"))?;
+    let coders_json = serde_json::to_string(&coders)
+        .map_err(|e| format!("coder 列表序列化失败: {e}"))?;
+    conn.execute(
+        "UPDATE task_main SET workflow_agent_ids=?1, reviewer_agent_id=?2, coder_agent_ids=?3 WHERE id=?4",
+        params![workflow_json, reviewer, coders_json, task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, String> {
     if input.task_name.trim().is_empty() {
         return Err("任务名称不能为空".into());
@@ -656,9 +1306,23 @@ pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, Strin
     if input.global_accept_criteria.trim().is_empty() {
         return Err("项目验收标准不能为空".into());
     }
-    if input.coder_agent_ids.is_empty() {
-        return Err("至少选择一个 Coder".into());
-    }
+    // 新前端只传 workflow_agent_ids；旧调用方仍可只传 reviewer + coders。
+    let workflow: Vec<i64> = if !input.workflow_agent_ids.is_empty() {
+        input.workflow_agent_ids.clone()
+    } else {
+        let mut ids: Vec<i64> = Vec::new();
+        if input.reviewer_agent_id > 0 {
+            ids.push(input.reviewer_agent_id);
+        }
+        for id in &input.coder_agent_ids {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids
+    };
+    validate_workflow(conn, &workflow)?;
+    let (reviewer_id, coder_ids) = derive_legacy_bindings(conn, &workflow)?;
     if input.module_max_round < 1 || input.global_max_round < 1 {
         return Err("轮次上限必须大于等于 1".into());
     }
@@ -674,24 +1338,27 @@ pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, Strin
             return Err("定时窗口开始时间和结束时间不能相同".into());
         }
     }
-    let coders_json = serde_json::to_string(&input.coder_agent_ids)
+    let coders_json = serde_json::to_string(&coder_ids)
         .map_err(|e| format!("coder 列表序列化失败: {e}"))?;
+    let workflow_json = serde_json::to_string(&workflow)
+        .map_err(|e| format!("工作流序列化失败: {e}"))?;
     let schedule_enabled = mode == "scheduled" && input.schedule_enabled;
     conn.execute(
         "INSERT INTO task_main(task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
-            coder_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,
-            work_dir,current_global_round,global_review_records,manual_review_enabled,
+            coder_agent_ids,workflow_agent_ids,module_max_round,global_max_round,global_contract,
+            task_phase,status,work_dir,current_global_round,global_review_records,manual_review_enabled,
             execution_mode,schedule_start,schedule_end,schedule_enabled,schedule_override,
             start_requested,pause_reason,followup_requirement,followup_mode,global_review_cycle,
             create_time)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,'','module_dev','pending',?8,0,'[]',?9,
-            ?10,?11,?12,?13,0,?14,'','','auto',1,?15)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'','module_dev','pending',?9,0,'[]',?10,
+            ?11,?12,?13,?14,0,?15,'','','auto',1,?16)",
         params![
             input.task_name.trim(),
             input.top_requirement.trim(),
             input.global_accept_criteria.trim(),
-            input.reviewer_agent_id,
+            reviewer_id,
             coders_json,
+            workflow_json,
             input.module_max_round,
             input.global_max_round,
             input.work_dir.trim(),
@@ -1298,13 +1965,22 @@ pub fn get_task_detail(conn: &Connection, task_id: i64) -> Result<TaskDetail, St
     let task = get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
     let subtasks = list_subtasks(conn, task_id)?;
     let logs = list_logs(conn, task_id)?;
-    let reviewer = get_agent(conn, task.reviewer_agent_id)?;
+    let workflow = workflow_steps(conn, &task);
+    let reviewer = workflow
+        .iter()
+        .find(|w| w.capabilities.iter().any(|c| c == "plan"))
+        .or_else(|| workflow.iter().find(|w| w.capabilities.iter().any(|c| c == "review")))
+        .and_then(|w| get_agent(conn, w.agent_id).ok().flatten());
     let mut coders = Vec::new();
-    for id in &task.coder_agent_ids {
-        if let Some(a) = get_agent(conn, *id)? {
+    for step in workflow
+        .iter()
+        .filter(|w| w.capabilities.iter().any(|c| c == "code"))
+    {
+        if let Some(a) = get_agent(conn, step.agent_id)? {
             coders.push(a);
         }
     }
+    let roles = list_roles(conn)?;
     let execution_events = list_events(conn, task_id, 2000)?;
     let human_messages = list_human_messages(conn, task_id)?;
     let pending_plan = parse_json::<PendingPlan>(&task.pending_plan_json);
@@ -1321,6 +1997,8 @@ pub fn get_task_detail(conn: &Connection, task_id: i64) -> Result<TaskDetail, St
         logs,
         reviewer,
         coders,
+        workflow,
+        roles,
         execution_events,
         human_messages,
         pending_plan,
@@ -1339,13 +2017,22 @@ pub fn get_iteration_detail(
     let iteration = get_iteration(conn, iteration_id)?
         .filter(|i| i.task_id == task_id)
         .ok_or_else(|| "迭代不存在或不属于该任务".to_string())?;
-    let reviewer = get_agent(conn, task.reviewer_agent_id)?;
+    let workflow = workflow_steps(conn, &task);
+    let reviewer = workflow
+        .iter()
+        .find(|w| w.capabilities.iter().any(|c| c == "plan"))
+        .or_else(|| workflow.iter().find(|w| w.capabilities.iter().any(|c| c == "review")))
+        .and_then(|w| get_agent(conn, w.agent_id).ok().flatten());
     let mut coders = Vec::new();
-    for id in &task.coder_agent_ids {
-        if let Some(a) = get_agent(conn, *id)? {
+    for step in workflow
+        .iter()
+        .filter(|w| w.capabilities.iter().any(|c| c == "code"))
+    {
+        if let Some(a) = get_agent(conn, step.agent_id)? {
             coders.push(a);
         }
     }
+    let roles = list_roles(conn)?;
     let iterations = list_iterations(conn, task_id)?;
     let subtasks = list_iteration_subtasks(conn, task_id, iteration_id)?;
     let logs = list_iteration_logs(conn, task_id, iteration_id)?;
@@ -1359,6 +2046,8 @@ pub fn get_iteration_detail(
         logs,
         reviewer,
         coders,
+        workflow,
+        roles,
         execution_events,
         human_messages,
     })
@@ -1406,7 +2095,8 @@ pub fn list_iteration_events(
 ) -> Result<Vec<TaskEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM task_event
+            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time,
+                agent_name,role_name FROM task_event
              WHERE task_id=?1 AND iteration_id=?2 ORDER BY id ASC LIMIT 5000",
         )
         .map_err(|e| e.to_string())?;
@@ -1588,6 +2278,13 @@ pub fn update_task_config(
     task_id: i64,
     cfg: &TaskConfigInput,
 ) -> Result<TaskMain, String> {
+    let current = get_task(conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    if let Some(workflow) = &cfg.workflow_agent_ids {
+        if current.status != "pending" {
+            return Err("任务已启动，工作流不可再修改".into());
+        }
+        save_task_workflow(conn, task_id, workflow)?;
+    }
     if cfg.module_max_round < 1 || cfg.global_max_round < 1 {
         return Err("轮次上限必须大于等于 1".into());
     }
@@ -1654,6 +2351,8 @@ fn row_to_event(row: &Row<'_>) -> rusqlite::Result<TaskEvent> {
         kind: row.get("kind")?,
         content: row.get("content")?,
         create_time: row.get("create_time")?,
+        agent_name: row.get("agent_name").unwrap_or_default(),
+        role_name: row.get("role_name").unwrap_or_default(),
     })
 }
 
@@ -1673,6 +2372,8 @@ pub fn live_event(
         kind: kind.to_string(),
         content: content.to_string(),
         create_time: now(),
+        agent_name: String::new(),
+        role_name: String::new(),
     }
 }
 
@@ -1682,6 +2383,19 @@ pub fn add_event(
     subtask_id: Option<i64>,
     kind: &str,
     content: &str,
+) -> Result<TaskEvent, String> {
+    add_event_with_agent(conn, task_id, subtask_id, kind, content, "", "")
+}
+
+/// 带 Agent 归属的事件写入：时间线据此显示“谁在说话”。
+pub fn add_event_with_agent(
+    conn: &Connection,
+    task_id: i64,
+    subtask_id: Option<i64>,
+    kind: &str,
+    content: &str,
+    agent_name: &str,
+    role_name: &str,
 ) -> Result<TaskEvent, String> {
     let create_time = now();
     if !log_persistence() {
@@ -1693,13 +2407,24 @@ pub fn add_event(
             kind: kind.to_string(),
             content: content.to_string(),
             create_time,
+            agent_name: agent_name.to_string(),
+            role_name: role_name.to_string(),
         });
     }
     let iteration_id = current_iteration_id(conn, task_id);
     conn.execute(
-        "INSERT INTO task_event(task_id,iteration_id,subtask_id,kind,content,create_time)
-         VALUES (?1,?2,?3,?4,?5,?6)",
-        params![task_id, iteration_id, subtask_id, kind, content, create_time],
+        "INSERT INTO task_event(task_id,iteration_id,subtask_id,kind,content,create_time,agent_name,role_name)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            task_id,
+            iteration_id,
+            subtask_id,
+            kind,
+            content,
+            create_time,
+            agent_name,
+            role_name
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(TaskEvent {
@@ -1710,14 +2435,16 @@ pub fn add_event(
         kind: kind.to_string(),
         content: content.to_string(),
         create_time,
+        agent_name: agent_name.to_string(),
+        role_name: role_name.to_string(),
     })
 }
 
 pub fn list_events(conn: &Connection, task_id: i64, limit: i64) -> Result<Vec<TaskEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM (
-                SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM task_event
+            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time,agent_name,role_name FROM (
+                SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time,agent_name,role_name FROM task_event
                 WHERE task_id=?1 ORDER BY id DESC LIMIT ?2
              ) ORDER BY id ASC",
         )
@@ -1733,7 +2460,7 @@ pub fn list_events(conn: &Connection, task_id: i64, limit: i64) -> Result<Vec<Ta
 pub fn list_all_events(conn: &Connection, task_id: i64) -> Result<Vec<TaskEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time FROM task_event
+            "SELECT id,task_id,iteration_id,subtask_id,kind,content,create_time,agent_name,role_name FROM task_event
              WHERE task_id=?1 ORDER BY id ASC LIMIT 50000",
         )
         .map_err(|e| e.to_string())?;
@@ -1915,10 +2642,9 @@ pub fn apply_pending_plan(
     if plan.subtasks.is_empty() {
         return Err("待审批方案没有子任务".into());
     }
-    let first_coder = task
-        .coder_agent_ids
+    let first_coder = resolve_task_agents(conn, task, crate::models::CAP_CODE)?
         .first()
-        .copied()
+        .map(|a| a.id)
         .ok_or_else(|| "任务未绑定 Coder".to_string())?;
     let items: Vec<(String, String)> = plan
         .subtasks
@@ -1951,10 +2677,9 @@ pub fn apply_followup_requirement(
     if items.is_empty() {
         return Err("追加需求没有生成任何子任务".into());
     }
-    let first_coder = task
-        .coder_agent_ids
+    let first_coder = resolve_task_agents(conn, task, crate::models::CAP_CODE)?
         .first()
-        .copied()
+        .map(|a| a.id)
         .ok_or_else(|| "任务未绑定 Coder".to_string())?;
     let appended = format!(
         "{}\n\n---\n## 追加需求（{}）\n{}\n\n### 评审梳理\n{}",
@@ -2034,12 +2759,27 @@ mod tests {
     /// 日志持久化开关是进程级全局变量：涉及事件写入的用例串行执行，避免互相干扰。
     static LOG_PERSIST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// 测试库：建表 + 角色种子 + 默认 reviewer/coder（id 1/2）。
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        seed_roles(&conn).unwrap();
+        for (name, role) in [("R", "reviewer"), ("C", "coder")] {
+            conn.execute(
+                "INSERT INTO agent_config(name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time)
+                 VALUES (?1,?2,'openai-compatible','mock','http://127.0.0.1:1/v1','k','',0.2,'2026-01-01 00:00:00')",
+                params![name, role],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
     /// 关闭日志持久化时事件只返回给前端，不写入数据库。
     #[test]
     fn log_persistence_off_skips_event_storage() {
         let _guard = LOG_PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = test_db();
         conn.execute(
             "INSERT INTO task_main(task_name,top_requirement,global_accept_criteria,reviewer_agent_id,
                 coder_agent_ids,module_max_round,global_max_round,work_dir,create_time)
@@ -2146,6 +2886,7 @@ mod tests {
             global_accept_criteria: "能新增日程".into(),
             reviewer_agent_id: 1,
             coder_agent_ids: vec![2],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 2,
             work_dir: "/tmp/agentcrew-iter".into(),
@@ -2160,8 +2901,7 @@ mod tests {
     /// 新建任务即登记 dev-1.0，且首个迭代处于 pending 状态。
     #[test]
     fn create_task_registers_dev_1_0_iteration() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = test_db();
         let task_id = create_task(&conn, &new_task_input()).unwrap();
         let iterations = list_iterations(&conn, task_id).unwrap();
         assert_eq!(iterations.len(), 1);
@@ -2175,8 +2915,7 @@ mod tests {
     /// 版本号规则：默认小版本 +1；子任务超过 5 个时升大版本、小版本归零。
     #[test]
     fn iteration_version_rule_bumps_minor_or_major() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = test_db();
         let task_id = create_task(&conn, &new_task_input()).unwrap();
 
         // 第一个迭代已落定 dev-1.0，下一次默认 dev-1.1。
@@ -2204,8 +2943,7 @@ mod tests {
     fn records_are_scoped_to_current_iteration() {
         let _guard = LOG_PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_log_persistence(true);
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = test_db();
         let task_id = create_task(&conn, &new_task_input()).unwrap();
         let first = current_iteration_id(&conn, task_id);
         let ev = add_event(&conn, task_id, None, "agent_message:reviewer", "第一版").unwrap();
@@ -2227,8 +2965,7 @@ mod tests {
     /// 迭代开始/结束/重开的时间与状态流转。
     #[test]
     fn iteration_lifecycle_tracks_time_and_status() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = test_db();
         let task_id = create_task(&conn, &new_task_input()).unwrap();
         mark_iteration_started(&conn, task_id).unwrap();
         let it = list_iterations(&conn, task_id).unwrap().remove(0);
@@ -2250,8 +2987,7 @@ mod tests {
     /// token 累计：新迭代从 0 开始累加；旧迭代（-1）首次收到用量时从实际值开始。
     #[test]
     fn iteration_tokens_accumulate() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = test_db();
         let task_id = create_task(&conn, &new_task_input()).unwrap();
         let it = list_iterations(&conn, task_id).unwrap().remove(0);
         assert_eq!(it.token_total, 0, "new iteration starts tracked at 0");
@@ -2344,9 +3080,279 @@ mod tests {
             assert_eq!(iterations[0].version, "dev-1.0");
             assert_eq!(iterations[0].requirement, "旧需求");
             assert_eq!(iterations[0].subtask_total, 1);
+            let task = get_task(&conn, 1).unwrap().unwrap();
+            assert_eq!(task.workflow_agent_ids, vec![1], "旧任务应回填工作流");
             let subtask = list_subtasks(&conn, 1).unwrap().remove(0);
             assert_eq!(subtask.iteration_id, iterations[0].id);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- V2.5：角色类型 / 线性工作流 ----------------
+
+    fn make_agent(conn: &Connection, name: &str, role: &str) -> AgentConfig {
+        save_agent(
+            conn,
+            &AgentInput {
+                id: None,
+                name: name.into(),
+                role_type: role.into(),
+                provider: "openai-compatible".into(),
+                model_name: "mock".into(),
+                base_url: "http://127.0.0.1:1/v1".into(),
+                api_key: "k".into(),
+                system_prompt: String::new(),
+                temperature: 0.2,
+            },
+        )
+        .unwrap()
+    }
+
+    /// 内置角色必须存在且不可删除；自定义角色可增删改。
+    #[test]
+    fn roles_seeded_and_builtin_protected() {
+        let conn = test_db();
+        let roles = list_roles(&conn).unwrap();
+        let reviewer = roles.iter().find(|r| r.key == "reviewer").unwrap();
+        assert!(reviewer.is_builtin);
+        assert!(reviewer.capabilities.iter().any(|c| c == "plan"));
+        let coder = roles.iter().find(|r| r.key == "coder").unwrap();
+        assert!(coder.capabilities.iter().any(|c| c == "code"));
+        // 预置产品经理角色（可删除）
+        assert!(roles.iter().any(|r| r.key == "product_manager"));
+
+        let err = delete_role(&conn, reviewer.id).unwrap_err();
+        assert!(err.contains("内置角色"));
+
+        let pm = save_role(
+            &conn,
+            &RoleInput {
+                id: None,
+                key: "product_owner".into(),
+                name: "产品负责人".into(),
+                description: "负责需求".into(),
+                capabilities: vec!["requirement".into()],
+                color: "#123456".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(pm.key, "product_owner");
+        make_agent(&conn, "PO", "product_owner");
+        // 有 Agent 引用时不允许删除
+        let err = delete_role(&conn, pm.id).unwrap_err();
+        assert!(err.contains("仍有 1 个 Agent"));
+        // 内置角色能力不可被修改
+        let updated = save_role(
+            &conn,
+            &RoleInput {
+                id: Some(reviewer.id),
+                key: String::new(),
+                name: "改名".into(),
+                description: "内置说明".into(),
+                capabilities: vec!["code".into()],
+                color: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.capabilities, reviewer.capabilities);
+        assert_eq!(updated.description, "内置说明");
+    }
+
+    /// 工作流必须覆盖方案/编码/评审三种能力，且不允许重复 Agent。
+    #[test]
+    fn workflow_validation_requires_capabilities() {
+        let conn = test_db();
+        let reviewer = get_agent(&conn, 1).unwrap().unwrap();
+        let coder = get_agent(&conn, 2).unwrap().unwrap();
+        assert!(validate_workflow(&conn, &[reviewer.id, coder.id]).is_ok());
+        assert!(validate_workflow(&conn, &[reviewer.id]).is_err());
+        assert!(validate_workflow(&conn, &[reviewer.id, reviewer.id, coder.id])
+            .unwrap_err()
+            .contains("重复"));
+        let req_only = save_role(
+            &conn,
+            &RoleInput {
+                id: None,
+                key: "pm_only".into(),
+                name: "产品经理".into(),
+                description: String::new(),
+                capabilities: vec!["requirement".into()],
+                color: String::new(),
+            },
+        )
+        .unwrap();
+        let pm = make_agent(&conn, "PM", &req_only.key);
+        // 只有需求能力的 Agent 不能替代方案/评审能力
+        let err = validate_workflow(&conn, &[pm.id, coder.id]).unwrap_err();
+        assert!(err.contains("方案设计"));
+        // 加入评审者后合法
+        assert!(validate_workflow(&conn, &[pm.id, reviewer.id, coder.id]).is_ok());
+    }
+
+    /// 按能力解析时严格按工作流顺序找第一个匹配的 Agent。
+    #[test]
+    fn resolve_agents_follow_workflow_order() {
+        let conn = test_db();
+        let reviewer = get_agent(&conn, 1).unwrap().unwrap();
+        let coder = get_agent(&conn, 2).unwrap().unwrap();
+        let pm = save_role(
+            &conn,
+            &RoleInput {
+                id: None,
+                key: "pm".into(),
+                name: "产品经理".into(),
+                description: String::new(),
+                capabilities: vec!["requirement".into()],
+                color: String::new(),
+            },
+        )
+        .unwrap();
+        let pm_agent = make_agent(&conn, "PM", &pm.key);
+        let task = TaskMain {
+            id: 1,
+            task_name: "t".into(),
+            top_requirement: "r".into(),
+            global_accept_criteria: "a".into(),
+            reviewer_agent_id: reviewer.id,
+            coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![pm_agent.id, reviewer.id, coder.id],
+            module_max_round: 3,
+            global_max_round: 2,
+            global_contract: String::new(),
+            task_phase: "module_dev".into(),
+            status: "pending".into(),
+            work_dir: "/tmp".into(),
+            current_global_round: 0,
+            global_review_cycle: 1,
+            global_review_records: Vec::new(),
+            create_time: String::new(),
+            baseline_tree: String::new(),
+            manual_review_enabled: false,
+            tech_stack: String::new(),
+            pending_plan_json: String::new(),
+            cancel_requested: false,
+            execution_mode: "later".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
+            schedule_override: false,
+            start_requested: false,
+            pause_reason: String::new(),
+            followup_requirement: String::new(),
+            followup_mode: "auto".into(),
+        };
+        assert_eq!(
+            resolve_task_agent(&conn, &task, crate::models::CAP_REQUIREMENT)
+                .unwrap()
+                .id,
+            pm_agent.id
+        );
+        assert_eq!(
+            resolve_task_agent(&conn, &task, crate::models::CAP_PLAN)
+                .unwrap()
+                .id,
+            reviewer.id
+        );
+        assert_eq!(
+            resolve_task_agent(&conn, &task, crate::models::CAP_REVIEW)
+                .unwrap()
+                .id,
+            reviewer.id
+        );
+        assert_eq!(
+            resolve_task_agent(&conn, &task, crate::models::CAP_CODE)
+                .unwrap()
+                .id,
+            coder.id
+        );
+        let steps = workflow_steps(&conn, &task);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].role_name, "产品经理");
+    }
+
+    /// 旧库 agent_config 的 reviewer/coder CHECK 约束必须能无损放开。
+    #[test]
+    fn migration_drops_agent_role_check_constraint() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                role_type TEXT NOT NULL CHECK (role_type IN ('reviewer','coder')),
+                provider TEXT NOT NULL DEFAULT '',
+                model_name TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '',
+                system_prompt TEXT NOT NULL DEFAULT '',
+                temperature REAL NOT NULL DEFAULT 0.3,
+                create_time TEXT NOT NULL
+            );
+            INSERT INTO agent_config(name,role_type,model_name,base_url,create_time)
+            VALUES ('老评审','reviewer','m','u','2026-01-01 00:00:00');
+            INSERT INTO agent_config(name,role_type,model_name,base_url,create_time)
+            VALUES ('老编码','coder','m','u','2026-01-01 00:00:00');",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
+        let agents = list_agents(&conn).unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].role_name, "评审者");
+        // 迁移后可以保存自定义角色（旧 CHECK 已移除）
+        let pm = save_role(
+            &conn,
+            &RoleInput {
+                id: None,
+                key: "product_manager2".into(),
+                name: "产品经理2".into(),
+                description: String::new(),
+                capabilities: vec!["requirement".into()],
+                color: String::new(),
+            },
+        )
+        .unwrap();
+        save_agent(
+            &conn,
+            &AgentInput {
+                id: None,
+                name: "PM2".into(),
+                role_type: pm.key,
+                provider: "openai-compatible".into(),
+                model_name: "m".into(),
+                base_url: "u".into(),
+                api_key: "k".into(),
+                system_prompt: String::new(),
+                temperature: 0.2,
+            },
+        )
+        .unwrap();
+        assert!(validate_workflow(&conn, &[agents[0].id, agents[1].id]).is_ok());
+    }
+
+    /// 任务只能在没有启动前修改工作流。
+    #[test]
+    fn workflow_editable_only_before_start() {
+        let conn = test_db();
+        let task_id = create_task(&conn, &new_task_input()).unwrap();
+        let cfg = TaskConfigInput {
+            module_max_round: 3,
+            global_max_round: 2,
+            manual_review_enabled: false,
+            workflow_agent_ids: Some(vec![2, 1]),
+            execution_mode: "later".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
+        };
+        let updated = update_task_config(&conn, task_id, &cfg).unwrap();
+        assert_eq!(updated.workflow_agent_ids, vec![2, 1]);
+        // 变成运行中后禁止修改
+        conn.execute(
+            "UPDATE task_main SET status='running' WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        let err = update_task_config(&conn, task_id, &cfg).unwrap_err();
+        assert!(err.contains("不可再修改"));
     }
 }

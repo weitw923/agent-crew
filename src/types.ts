@@ -1,6 +1,42 @@
 // 与 Rust 后端 serde 结构一一对应的前端类型定义。
 
-export type RoleType = "reviewer" | "coder";
+/** 角色能力标签：需求梳理 / 方案设计 / 编码实现 / 评审验收。 */
+export type Capability = "requirement" | "plan" | "code" | "review";
+
+/** 角色类型实体（内置 reviewer / coder + 用户自定义角色）。 */
+export interface RoleType {
+  id: number;
+  key: string;
+  name: string;
+  description: string;
+  capabilities: Capability[];
+  color: string;
+  is_builtin: boolean;
+  sort_order: number;
+  create_time: string;
+  /** 使用该角色的 Agent 数量。 */
+  agent_count: number;
+}
+
+export interface RoleInput {
+  id?: number;
+  key: string;
+  name: string;
+  description: string;
+  capabilities: Capability[];
+  color: string;
+}
+
+/** 任务工作流中的一步（后端派生的展示结构）。 */
+export interface WorkflowStep {
+  order: number;
+  agent_id: number;
+  agent_name: string;
+  role_key: string;
+  role_name: string;
+  role_color: string;
+  capabilities: Capability[];
+}
 export type TaskStatus =
   | "pending"
   | "planning"
@@ -28,7 +64,7 @@ export type SubtaskStage =
 export interface AgentConfig {
   id: number;
   name: string;
-  role_type: RoleType;
+  role_type: string;
   provider: string;
   model_name: string;
   base_url: string;
@@ -36,12 +72,15 @@ export interface AgentConfig {
   system_prompt: string;
   temperature: number;
   create_time: string;
+  role_name?: string;
+  role_color?: string;
+  role_capabilities?: Capability[];
 }
 
 export interface AgentInput {
   id?: number;
   name: string;
-  role_type: RoleType;
+  role_type: string;
   provider: string;
   model_name: string;
   base_url: string;
@@ -146,6 +185,8 @@ export interface TaskMain {
   global_accept_criteria: string;
   reviewer_agent_id: number;
   coder_agent_ids: number[];
+  /** 任务级线性工作流（按顺序的 Agent id）。 */
+  workflow_agent_ids?: number[];
   module_max_round: number;
   global_max_round: number;
   global_contract: string;
@@ -188,6 +229,9 @@ export interface TaskEvent {
   kind: string;
   content: string;
   create_time: string;
+  /** 产生该事件的 Agent 与角色名（系统事件为空）。 */
+  agent_name?: string;
+  role_name?: string;
 }
 
 export interface ChatMessage {
@@ -223,6 +267,8 @@ export interface TaskDetail {
   logs: TaskLog[];
   reviewer: AgentConfig | null;
   coders: AgentConfig[];
+  workflow?: WorkflowStep[];
+  roles?: RoleType[];
   execution_events: TaskEvent[];
   human_messages: HumanMessage[];
   pending_plan: PendingPlan | null;
@@ -240,6 +286,8 @@ export interface IterationDetail {
   logs: TaskLog[];
   reviewer: AgentConfig | null;
   coders: AgentConfig[];
+  workflow?: WorkflowStep[];
+  roles?: RoleType[];
   execution_events: TaskEvent[];
   human_messages: HumanMessage[];
 }
@@ -247,6 +295,7 @@ export interface IterationDetail {
 export interface TaskSummary extends TaskMain {
   reviewer_name: string;
   coder_names: string[];
+  workflow: WorkflowStep[];
   subtask_count: number;
   completed_count: number;
   /** 当前（最新）迭代版本号。 */
@@ -259,6 +308,7 @@ export interface NewTaskInput {
   global_accept_criteria: string;
   reviewer_agent_id: number;
   coder_agent_ids: number[];
+  workflow_agent_ids: number[];
   module_max_round: number;
   global_max_round: number;
   work_dir: string;
@@ -273,6 +323,8 @@ export interface RuntimeConfigInput {
   module_max_round: number;
   global_max_round: number;
   manual_review_enabled: boolean;
+  /** 仅任务未启动时允许修改。 */
+  workflow_agent_ids?: number[];
   execution_mode: ExecutionMode;
   schedule_start: string;
   schedule_end: string;
