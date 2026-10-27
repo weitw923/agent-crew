@@ -30,6 +30,8 @@ const CONVERSATION_KINDS = new Set([
   "human_message_delivered",
   "human_extend_rounds",
   "requirements_updated",
+  "requirement_queued",
+  "requirement_accepted",
   "config_updated",
   "tool_call",
   "dsh_error",
@@ -50,7 +52,8 @@ function include(ev: TaskEvent) {
     return (
       ev.kind === "llm_response:code_review" ||
       ev.kind === "llm_response:summary_review" ||
-      ev.kind === "llm_response:global_review"
+      ev.kind === "llm_response:global_review" ||
+      ev.kind === "llm_response:requirement_intake"
     );
   }
   return CONVERSATION_KINDS.has(base);
@@ -63,6 +66,7 @@ function roleOf(ev: TaskEvent) {
   if (
     ev.kind === "agent_message:reviewer" ||
     base === "module_design" ||
+    base === "requirement_accepted" ||
     base === "llm_response"
   )
     return { name: props.reviewerName || "技术总监", cls: "reviewer", label: "技术总监" };
@@ -73,6 +77,7 @@ function roleOf(ev: TaskEvent) {
   if (
     ev.kind.startsWith("human_message") ||
     base === "requirements_updated" ||
+    base === "requirement_queued" ||
     base === "human_extend_rounds"
   )
     return { name: "你", cls: "human", label: "人工" };
@@ -97,6 +102,8 @@ function labelOf(ev: TaskEvent) {
     human_message_delivered: "人工消息已注入",
     human_extend_rounds: "人工追加轮次",
     requirements_updated: "需求已更新",
+    requirement_queued: "追加需求已提交",
+    requirement_accepted: "增量模块已创建",
     config_updated: "配置更新",
     tool_call: "工具调用",
     tool_result: "工具结果",
@@ -163,7 +170,12 @@ function eventClass(ev: TaskEvent) {
   const base = baseKind(ev.kind);
   if (base === "llm_error" || base === "dsh_error" || base.endsWith("_rejected"))
     return "error";
-  if (base === "human_message" || base === "requirements_updated") return "human";
+  if (
+    base === "human_message" ||
+    base === "requirements_updated" ||
+    base === "requirement_queued"
+  )
+    return "human";
   if (base === "tool_call" || base === "tool_result") return "tool";
   return "";
 }

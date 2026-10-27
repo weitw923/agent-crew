@@ -54,6 +54,92 @@ pub fn planner_user(task_name: &str, requirement: &str, acceptance: &str) -> Str
 }
 
 // ------------------------------------------------------------------
+// 1.5 已完成任务追加需求：增量梳理（避免过度拆解）
+// ------------------------------------------------------------------
+pub fn requirement_intake_system() -> String {
+    r#"你是本项目的增量需求评审者（Reviewer）。项目已经完成并通过验收，用户现在追加新的问题或需求。你只负责梳理本次增量，不重新拆解整个项目。
+
+只允许输出一个合法 JSON 对象，禁止输出 Markdown 代码围栏、解释文字或任何 JSON 之外的字符。
+
+JSON 必须严格符合以下结构：
+{
+  "decision": "simple" 或 "complex",
+  "analysis": "用 1-3 句话概括本次要做什么、为什么这样判断",
+  "subtasks": [
+    { "name": "模块名称（具体、唯一）", "accept_criteria": "该模块可验证的验收标准" }
+  ]
+}
+
+硬性规则：
+1. 默认按 simple 处理：只要能在现有代码上通过一个模块完成，就必须只输出 1 个子任务，不要为了显得完整而拆分。
+2. 只有需求明显包含多个相互独立、必须分别验收的交付物时，才输出 complex；complex 只能有 2-6 个子任务。
+3. decision=simple 时 subtasks 必须恰好 1 个；decision=complex 时 subtasks 必须为 2-6 个。
+4. 禁止重新拆解已完成项目，禁止把“检查、总结、收尾、联调”单独拆成子任务，禁止输出与技术栈/全局契约相关的内容。
+5. 子任务名称必须具体、唯一，不能与已完成模块重名；accept_criteria 必须可验证，覆盖新增需求的核心行为。
+6. 技术栈、全局契约、数据库前缀、返回体、鉴权方式全部沿用现有项目，不要另起炉灶。
+7. 不要输出代码。不要输出 JSON 以外的任何内容。"#
+        .to_string()
+}
+
+pub fn requirement_intake_user(
+    task_name: &str,
+    top_requirement: &str,
+    acceptance: &str,
+    tech_stack: &str,
+    contract: &str,
+    completed_summaries: &str,
+    existing_names: &str,
+    new_requirement: &str,
+    human_instructions: &str,
+    single_mode: bool,
+) -> String {
+    let mode_block = if single_mode {
+        "\n# 用户已选择的处理模式\n用户选择【单模块快改】：必须 decision=simple，且 subtasks 恰好 1 个。即使需求看起来偏大，也合并为一个可交付模块，不要拆分。"
+    } else {
+        "\n# 处理模式\n用户未指定模式：请自动判断。绝大多数增量需求应输出 1 个子任务，只有确实存在多个独立交付物时才允许 complex。"
+    };
+    format!(
+        r#"# 任务名称
+{task_name}
+
+# 原始顶层需求（历史，只读）
+{requirement}
+
+# 项目验收标准
+{acceptance}
+
+# 现有技术栈（只读，必须沿用）
+{tech_stack}
+
+# 现有全局契约（只读，必须沿用）
+{contract}
+
+# 已完成模块摘要（只读，不可重做）
+{summaries}
+
+# 已完成模块名称（新子任务禁止重名）
+{existing_names}
+
+# 用户本次追加的问题 / 需求
+{new_requirement}
+
+# 人工补充说明
+{human}
+{mode_block}
+
+请梳理本次增量并输出 JSON。记住：简单需求只给 1 个子任务，不要过度设计。"#,
+        requirement = truncate_chars(top_requirement, 20_000),
+        contract = truncate_chars(contract, 20_000),
+        summaries = truncate_chars(completed_summaries, 40_000),
+        human = if human_instructions.trim().is_empty() {
+            "（无）"
+        } else {
+            human_instructions
+        },
+    )
+}
+
+// ------------------------------------------------------------------
 // 2. Coder 编码
 // ------------------------------------------------------------------
 pub fn coder_system(agent: &AgentConfig) -> String {
@@ -441,7 +527,7 @@ pub fn chat_system() -> String {
 1. 只回答问题、解释方案、补充咨询；不要声称已经拆解任务、派发 Coder 或启动开发流程。
 2. 不要输出 JSON，不要使用工具，不要调用任何任务调度能力。
 3. 可以基于提供的任务需求、技术栈、全局契约和已完成模块摘要给出建议。
-4. 如果用户要求修改实际任务，请提示他到【任务流水线】的需求编辑或人工消息入口操作。
+4. 如果用户要求修改实际任务，请提示他关闭问答，使用任务页的「追加需求」入口；任务完成后新增需求也从那里进入流水线。
 5. 回答简洁、具体，使用中文。这个会话与任务流水线上下文互相隔离。"#
         .to_string()
 }

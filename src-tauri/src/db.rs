@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS task_main (
     schedule_override      INTEGER NOT NULL DEFAULT 0,
     start_requested        INTEGER NOT NULL DEFAULT 0,
     pause_reason           TEXT NOT NULL DEFAULT '',
+    followup_requirement   TEXT NOT NULL DEFAULT '',
+    followup_mode          TEXT NOT NULL DEFAULT 'auto',
+    global_review_cycle    INTEGER NOT NULL DEFAULT 1,
     create_time            TEXT NOT NULL
 );
 
@@ -243,6 +246,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             "start_requested INTEGER NOT NULL DEFAULT 0",
         ),
         ("pause_reason", "pause_reason TEXT NOT NULL DEFAULT ''"),
+        (
+            "followup_requirement",
+            "followup_requirement TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "followup_mode",
+            "followup_mode TEXT NOT NULL DEFAULT 'auto'",
+        ),
+        (
+            "global_review_cycle",
+            "global_review_cycle INTEGER NOT NULL DEFAULT 1",
+        ),
     ] {
         ensure_column(conn, "task_main", column, ddl)?;
     }
@@ -459,6 +474,7 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskMain> {
         status: row.get("status")?,
         work_dir: row.get("work_dir")?,
         current_global_round: row.get("current_global_round")?,
+        global_review_cycle: row.get::<_, i64>("global_review_cycle").unwrap_or(1).max(1),
         global_review_records: parse_json(&records_raw),
         create_time: row.get("create_time")?,
         baseline_tree: row.get("baseline_tree").unwrap_or_default(),
@@ -479,6 +495,10 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<TaskMain> {
         schedule_override: row.get::<_, i64>("schedule_override").unwrap_or(0) != 0,
         start_requested: row.get::<_, i64>("start_requested").unwrap_or(0) != 0,
         pause_reason: row.get("pause_reason").unwrap_or_default(),
+        followup_requirement: row.get("followup_requirement").unwrap_or_default(),
+        followup_mode: row
+            .get::<_, String>("followup_mode")
+            .unwrap_or_else(|_| "auto".into()),
     })
 }
 
@@ -486,7 +506,8 @@ const TASK_COLS: &str = "id,task_name,top_requirement,global_accept_criteria,rev
     coder_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,work_dir,
     current_global_round,global_review_records,baseline_tree,manual_review_enabled,tech_stack,
     pending_plan_json,cancel_requested,execution_mode,schedule_start,schedule_end,schedule_enabled,
-    schedule_override,start_requested,pause_reason,create_time";
+    schedule_override,start_requested,pause_reason,followup_requirement,followup_mode,
+    global_review_cycle,create_time";
 
 pub fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>, String> {
     let agents = list_agents(conn)?;
@@ -592,9 +613,10 @@ pub fn create_task(conn: &Connection, input: &NewTaskInput) -> Result<i64, Strin
             coder_agent_ids,module_max_round,global_max_round,global_contract,task_phase,status,
             work_dir,current_global_round,global_review_records,manual_review_enabled,
             execution_mode,schedule_start,schedule_end,schedule_enabled,schedule_override,
-            start_requested,pause_reason,create_time)
+            start_requested,pause_reason,followup_requirement,followup_mode,global_review_cycle,
+            create_time)
          VALUES (?1,?2,?3,?4,?5,?6,?7,'','module_dev','pending',?8,0,'[]',?9,
-            ?10,?11,?12,?13,0,?14,'',?15)",
+            ?10,?11,?12,?13,0,?14,'','','auto',1,?15)",
         params![
             input.task_name.trim(),
             input.top_requirement.trim(),
@@ -626,7 +648,8 @@ pub fn save_task(conn: &Connection, task: &TaskMain) -> Result<(), String> {
             current_global_round=?4, global_review_records=?5, baseline_tree=?6,
             tech_stack=?7, pending_plan_json=?8, execution_mode=?9, schedule_start=?10,
             schedule_end=?11, schedule_enabled=?12, schedule_override=?13,
-            start_requested=?14, pause_reason=?15 WHERE id=?16",
+            start_requested=?14, pause_reason=?15, followup_requirement=?16,
+            followup_mode=?17, global_review_cycle=?18 WHERE id=?19",
         params![
             task.global_contract,
             task.task_phase,
@@ -643,6 +666,9 @@ pub fn save_task(conn: &Connection, task: &TaskMain) -> Result<(), String> {
             if task.schedule_override { 1 } else { 0 },
             if task.start_requested { 1 } else { 0 },
             task.pause_reason,
+            task.followup_requirement,
+            task.followup_mode,
+            task.global_review_cycle.max(1),
             task.id
         ],
     )
@@ -714,6 +740,17 @@ pub fn insert_subtasks(
     coder_id: i64,
     max_round: i64,
 ) -> Result<Vec<Subtask>, String> {
+    insert_subtasks_from(conn, task_id, items, coder_id, max_round, 1)
+}
+
+fn insert_subtasks_from(
+    conn: &mut Connection,
+    task_id: i64,
+    items: &[(String, String)],
+    coder_id: i64,
+    max_round: i64,
+    start_index: i64,
+) -> Result<Vec<Subtask>, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     for (i, (name, criteria)) in items.iter().enumerate() {
         tx.execute(
@@ -723,7 +760,7 @@ pub fn insert_subtasks(
             params![
                 task_id,
                 name.trim(),
-                (i + 1) as i64,
+                start_index + i as i64,
                 criteria,
                 coder_id,
                 max_round
@@ -1349,6 +1386,73 @@ pub fn apply_pending_plan(
     task.status = "running".into();
     save_task(conn, task)?;
     Ok(())
+}
+
+/// 评审完成对追加需求的梳理后，一次性写入新需求、追加子任务并重置本次迭代的全局评审轮次。
+pub fn apply_followup_requirement(
+    conn: &mut Connection,
+    task: &mut TaskMain,
+    requirement: &str,
+    analysis: &str,
+    items: &[(String, String)],
+) -> Result<Vec<Subtask>, String> {
+    if items.is_empty() {
+        return Err("追加需求没有生成任何子任务".into());
+    }
+    let first_coder = task
+        .coder_agent_ids
+        .first()
+        .copied()
+        .ok_or_else(|| "任务未绑定 Coder".to_string())?;
+    let appended = format!(
+        "{}\n\n---\n## 追加需求（{}）\n{}\n\n### 评审梳理\n{}",
+        task.top_requirement.trim(),
+        now(),
+        requirement.trim(),
+        analysis.trim()
+    );
+    let next_cycle = task.global_review_cycle.max(1) + 1;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE task_main SET top_requirement=?1, followup_requirement='', followup_mode='auto',
+            task_phase='module_dev', status='running', current_global_round=0,
+            global_review_cycle=?2, pause_reason='' WHERE id=?3",
+        params![appended, next_cycle, task.id],
+    )
+    .map_err(|e| e.to_string())?;
+    let start: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(sort_index), 0) + 1 FROM subtask WHERE task_id=?1",
+            params![task.id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    for (i, (name, criteria)) in items.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO subtask(task_id,subtask_name,sort_index,accept_criteria,assigned_coder_id,
+                current_round,max_round,status,current_stage,summary_content,summary_file_path,iteration_records,design_content)
+             VALUES (?1,?2,?3,?4,?5,0,?6,'waiting','queued','','','[]','')",
+            params![
+                task.id,
+                name.trim(),
+                start + i as i64,
+                criteria,
+                first_coder,
+                task.module_max_round
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    task.top_requirement = appended;
+    task.followup_requirement.clear();
+    task.followup_mode = "auto".into();
+    task.task_phase = "module_dev".into();
+    task.status = "running".into();
+    task.current_global_round = 0;
+    task.global_review_cycle = next_cycle;
+    task.pause_reason.clear();
+    list_subtasks(conn, task.id)
 }
 
 pub fn set_paused(conn: &Connection, task_id: i64, message: &str) -> Result<(), String> {

@@ -141,6 +141,17 @@ pub fn start_task(app: AppHandle, task_id: i64) -> Result<StartOutcome, String> 
 }
 
 #[tauri::command]
+pub fn append_requirement(
+    app: AppHandle,
+    task_id: i64,
+    requirement: String,
+    mode: String,
+) -> Result<(), String> {
+    ensure_not_running(&app, task_id)?;
+    orchestrator::append_requirement(Some(&app), task_id, &requirement, &mode)
+}
+
+#[tauri::command]
 pub fn resume_task(app: AppHandle, task_id: i64) -> Result<(), String> {
     ensure_not_running(&app, task_id)?;
     orchestrator::resume_task(Some(&app), task_id)

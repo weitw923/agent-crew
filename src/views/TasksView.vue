@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import NewTaskModal from "../components/NewTaskModal.vue";
+import FollowUpModal from "../components/FollowUpModal.vue";
 import type { TaskSummary } from "../types";
 import { deleteTask, listTasks, resumeTask, startTask } from "../api";
 import { errorMessage, showToast } from "../toast";
@@ -11,6 +12,7 @@ const emit = defineEmits<{ (e: "open-task", id: number): void }>();
 const tasks = ref<TaskSummary[]>([]);
 const loading = ref(false);
 const showNew = ref(false);
+const followupTask = ref<TaskSummary | null>(null);
 let unlisten: UnlistenFn | null = null;
 
 async function load() {
@@ -36,6 +38,11 @@ const statusMeta: Record<string, { label: string; cls: string }> = {
 };
 
 function statusOf(task: TaskSummary) {
+  if (
+    task.task_phase === "requirement_intake" &&
+    (task.status === "planning" || task.status === "running")
+  )
+    return { label: "梳理追加需求", cls: "badge-blue" };
   if (task.status === "pending") {
     if (task.pause_reason === "concurrency") return { label: "等待并发名额", cls: "badge-yellow" };
     if (task.execution_mode === "scheduled" && task.schedule_enabled)
@@ -52,6 +59,13 @@ const modeLabel: Record<string, string> = {
   immediate: "立即执行",
   later: "稍后执行",
   scheduled: "定时执行"
+};
+
+const phaseLabel: Record<string, string> = {
+  module_dev: "模块开发",
+  global_review: "全局评审",
+  plan_approval: "方案审批",
+  requirement_intake: "需求梳理"
 };
 
 function scheduleText(task: TaskSummary) {
@@ -90,6 +104,12 @@ async function remove(task: TaskSummary) {
 
 function onCreated(taskId: number) {
   showNew.value = false;
+  emit("open-task", taskId);
+}
+
+function onFollowupQueued(taskId: number) {
+  followupTask.value = null;
+  void load();
   emit("open-task", taskId);
 }
 
@@ -144,7 +164,7 @@ onUnmounted(() => unlisten?.());
               轮次：模块 <b>{{ task.module_max_round }}</b> / 全局
               <b>{{ task.global_max_round }}</b>
             </div>
-            <div>阶段：<b>{{ task.task_phase === "global_review" ? "全局评审" : task.task_phase === "plan_approval" ? "方案审批" : "模块开发" }}</b></div>
+            <div>阶段：<b>{{ phaseLabel[task.task_phase] ?? task.task_phase }}</b></div>
             <div>执行：<b>{{ modeLabel[task.execution_mode] ?? task.execution_mode }}</b></div>
             <div v-if="scheduleText(task)">窗口：<b>{{ scheduleText(task) }}</b></div>
             <div>创建：<b>{{ task.create_time }}</b></div>
@@ -157,6 +177,13 @@ onUnmounted(() => unlisten?.());
           <div class="task-actions">
             <button class="btn btn-sm btn-primary" @click="emit('open-task', task.id)">
               打开详情
+            </button>
+            <button
+              v-if="task.status === 'completed'"
+              class="btn btn-sm"
+              @click="followupTask = task"
+            >
+              ＋ 追加需求
             </button>
             <button
               v-if="
@@ -190,5 +217,12 @@ onUnmounted(() => unlisten?.());
     </div>
 
     <NewTaskModal v-if="showNew" @close="showNew = false" @created="onCreated" />
+    <FollowUpModal
+      v-if="followupTask"
+      :task="followupTask"
+      :subtask-count="followupTask.subtask_count"
+      @close="followupTask = null"
+      @queued="onFollowupQueued"
+    />
   </div>
 </template>

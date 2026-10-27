@@ -5,6 +5,7 @@ import SubtaskCard from "../components/SubtaskCard.vue";
 import ConversationPanel from "../components/ConversationPanel.vue";
 import ChatPanel from "../components/ChatPanel.vue";
 import RequirementsModal from "../components/RequirementsModal.vue";
+import FollowUpModal from "../components/FollowUpModal.vue";
 import type { ExecutionMode, Subtask, TaskDetail, TaskEvent, TaskMain } from "../types";
 import {
   approveDesign,
@@ -61,6 +62,7 @@ const configForm = reactive({
 
 const showChat = ref(false);
 const showRequirements = ref(false);
+const showFollowup = ref(false);
 const extraRounds = ref(2);
 
 const humanMessage = ref("");
@@ -80,6 +82,8 @@ const task = computed(() => detail.value?.task ?? null);
 const subtasks = computed<Subtask[]>(() => detail.value?.subtasks ?? []);
 const isGlobal = computed(() => task.value?.task_phase === "global_review");
 const isPlanApproval = computed(() => task.value?.task_phase === "plan_approval");
+const isIntake = computed(() => task.value?.task_phase === "requirement_intake");
+const isCompleted = computed(() => task.value?.status === "completed");
 const isRunning = computed(
   () => task.value?.status === "running" || task.value?.status === "planning"
 );
@@ -133,6 +137,16 @@ const canTerminate = computed(
     task.value.status !== "terminated"
 );
 const canContinue = computed(() => !!task.value && task.value.status === "terminated");
+const phaseLabel = computed(() => {
+  if (task.value?.status === "completed") return "全局评审完成";
+  const map: Record<string, string> = {
+    module_dev: "模块开发",
+    global_review: "全局评审",
+    plan_approval: "方案审批",
+    requirement_intake: "需求梳理"
+  };
+  return map[task.value?.task_phase ?? ""] ?? "模块开发";
+});
 const pendingHumanSubtask = computed(
   () => subtasks.value.find((s) => s.status === "needs_human") ?? null
 );
@@ -175,6 +189,11 @@ const humanReason = computed(() => {
 const statusText = computed(() => {
   const t = task.value;
   if (!t) return "";
+  if (
+    t.task_phase === "requirement_intake" &&
+    (t.status === "planning" || t.status === "running")
+  )
+    return "梳理追加需求";
   if (t.status === "pending") {
     if (t.pause_reason === "concurrency") return "等待并发名额";
     if (t.execution_mode === "scheduled")
@@ -209,7 +228,13 @@ const scheduleText = computed(() => {
 const phaseBanner = computed(() => {
   const t = task.value;
   if (!t) return { text: "", cls: "" };
-  if (t.status === "completed") return { text: "✅ 当前阶段：全部完成", cls: "done" };
+  if (t.status === "completed")
+    return { text: "✅ 当前阶段：全部完成 · 可继续追加需求", cls: "done" };
+  if (
+    t.task_phase === "requirement_intake" &&
+    (t.status === "planning" || t.status === "running")
+  )
+    return { text: "🧠 当前阶段：评审正在梳理追加需求", cls: "global" };
   if (t.status === "terminated")
     return { text: "⛔ 当前阶段：任务已终止，可继续任务", cls: "human" };
   if (t.status === "failed") return { text: "❌ 当前阶段：执行失败", cls: "human" };
@@ -278,6 +303,7 @@ function feedbackText(rec: { review_decision: string; review_feedback: string } 
   return rec.review_feedback || "（无评审意见）";
 }
 function eventKindLabel(kind: string) {
+  if (kind === "llm_response:requirement_intake") return "追加需求梳理结果";
   const map: Record<string, string> = {
     llm_request: "LLM 请求",
     llm_response: "LLM 响应",
@@ -294,6 +320,9 @@ function eventKindLabel(kind: string) {
     plan_approval: "方案待审批",
     plan_approved: "方案通过",
     plan_rejected: "方案驳回",
+    requirement_queued: "追加需求已提交",
+    requirement_accepted: "追加需求已梳理",
+    requirement_intake: "追加需求梳理",
     design_approved: "设计通过",
     design_rejected: "设计驳回",
     config_updated: "配置更新",
@@ -315,7 +344,12 @@ function eventKindClass(kind: string) {
     return "ev-error";
   if (kind.startsWith("llm_response") || kind === "plan_approved" || kind === "design_approved")
     return "ev-ok";
-  if (kind === "human_message" || kind === "human_message_delivered") return "ev-human";
+  if (
+    kind === "human_message" ||
+    kind === "human_message_delivered" ||
+    kind === "requirement_queued"
+  )
+    return "ev-human";
   if (kind.startsWith("llm_request")) return "ev-request";
   return "";
 }
@@ -407,6 +441,16 @@ async function doResume() {
   } finally {
     actionBusy.value = false;
   }
+}
+
+function openFollowup() {
+  if (!task.value) return;
+  showFollowup.value = true;
+}
+
+function onFollowupQueued() {
+  showFollowup.value = false;
+  scheduleReload();
 }
 
 async function doRun() {
@@ -752,11 +796,12 @@ onUnmounted(() => {
           <div class="meta">
             <span>评审：{{ detail?.reviewer?.name ?? "—" }}</span>
             <span>Coder：{{ detail?.coders.map((c) => c.name).join("、") || "—" }}</span>
-            <span>阶段：{{ task.task_phase === "global_review" ? "全局评审" : task.task_phase === "plan_approval" ? "方案审批" : "模块开发" }}</span>
+            <span>阶段：{{ phaseLabel }}</span>
             <span>状态：{{ statusText }}</span>
             <span>执行：{{ executionModeLabel }}</span>
             <span v-if="scheduleText">窗口：{{ scheduleText }}</span>
             <span>人工审核：{{ task.manual_review_enabled ? "开启" : "关闭" }}</span>
+            <span>迭代：第 {{ task.global_review_cycle }} 次</span>
             <span>轮次：{{ task.current_global_round }}/{{ task.global_max_round }}</span>
           </div>
         </div>
@@ -769,6 +814,14 @@ onUnmounted(() => {
             @click="showRequirements = true"
           >
             📝 需求
+          </button>
+          <button
+            v-if="isCompleted"
+            class="btn btn-sm btn-primary"
+            :disabled="actionBusy"
+            @click="openFollowup"
+          >
+            ＋ 追加需求
           </button>
           <button class="btn btn-sm" :disabled="actionBusy" @click="showChat = true">
             💬 问答
@@ -891,8 +944,16 @@ onUnmounted(() => {
           <template v-else>
             <div v-if="task.status === 'planning'" class="empty-state" style="padding: 30px 10px">
               <div class="big">🧠</div>
-              <div class="title">技术总监正在拆解需求</div>
-              <div class="small">可随时点击“终止执行”或输入人工消息介入。</div>
+              <div class="title">
+                {{ isIntake ? "技术总监正在梳理追加需求" : "技术总监正在拆解需求" }}
+              </div>
+              <div class="small">
+                {{
+                  isIntake
+                    ? "简单改动只会创建 1 个子任务；复杂需求才会拆成少量模块。"
+                    : "可随时点击“终止执行”或输入人工消息介入。"
+                }}
+              </div>
             </div>
 
             <div v-else-if="!subtasks.length" class="empty-state" style="padding: 30px 10px">
@@ -904,17 +965,23 @@ onUnmounted(() => {
               :key="sub.id"
               :subtask="sub"
               :selected="sub.id === selectedSubtaskId"
-              :frozen="isGlobal"
+              :frozen="isGlobal && !isCompleted"
               @select="selectedSubtaskId = sub.id"
             />
 
             <div v-if="isGlobal" class="panel" style="padding: 11px">
               <div class="flex">
-                <span class="badge badge-yellow">全局评审收口</span>
-                <span class="small muted">队列已冻结</span>
+                <span class="badge" :class="isCompleted ? 'badge-green' : 'badge-yellow'">
+                  {{ isCompleted ? "✅ 全局评审已通过" : "全局评审收口" }}
+                </span>
+                <span class="small muted">{{ isCompleted ? "可回看模块历史" : "队列已冻结" }}</span>
               </div>
               <div class="small muted" style="margin-top: 6px">
-                全部模块已完成，正在进行跨模块一致性/安全/命名规范收口。
+                {{
+                  isCompleted
+                    ? "全部模块已完成；可以点击左侧模块回看 diff/摘要，也可以点击「追加需求」继续迭代。"
+                    : "全部模块已完成，正在进行跨模块一致性/安全/命名规范收口。"
+                }}
               </div>
             </div>
           </template>
@@ -940,6 +1007,96 @@ onUnmounted(() => {
                   <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doResume">
                     继续任务
                   </button>
+                </div>
+              </div>
+            </template>
+            <template
+              v-else-if="
+                isIntake && (task.status === 'paused' || task.status === 'pending')
+              "
+            >
+              <div class="human-panel">
+                <div class="hp-head">
+                  <span class="badge badge-yellow">
+                    {{ task.status === "pending" ? "等待启动" : "已暂停" }}
+                  </span>
+                  <b>追加需求已保留，尚未开始梳理</b>
+                </div>
+                <div class="hp-text">
+                  点击下方按钮继续，评审会重新梳理本次追加需求；不会丢失已输入内容。
+                </div>
+                <div class="hp-actions">
+                  <button
+                    class="btn btn-sm btn-primary"
+                    :disabled="actionBusy"
+                    @click="task.status === 'pending' ? doRun() : doResume()"
+                  >
+                    {{ task.status === "pending" ? "运行" : "恢复梳理" }}
+                  </button>
+                </div>
+              </div>
+            </template>
+            <template v-else-if="isIntake && task.status !== 'failed'">
+              <div class="human-panel completed-panel">
+                <div class="hp-head">
+                  <span class="badge badge-blue">需求梳理中</span>
+                  <b>评审正在判断本次改动规模</b>
+                  <span class="hp-round">
+                    {{ task.followup_mode === "single" ? "单模块快改" : "自动判断" }}
+                  </span>
+                </div>
+                <div class="hp-text">
+                  评审会沿用现有技术栈与全局契约，只梳理这次新增内容，不会重新拆解已完成项目。
+                  简单改动只创建 1 个子任务；复杂需求才会拆成少量模块。
+                </div>
+                <div v-if="task.followup_requirement" class="hp-reason">
+                  <div class="hp-label">本次追加需求</div>
+                  <div class="hp-reason-text">{{ task.followup_requirement }}</div>
+                </div>
+              </div>
+            </template>
+            <template v-else-if="task.status === 'failed'">
+              <div class="human-panel">
+                <div class="hp-head">
+                  <span class="badge badge-red">执行失败</span>
+                  <b>{{ isIntake ? "追加需求梳理未完成" : "任务执行中断" }}</b>
+                </div>
+                <div class="hp-text">
+                  {{
+                    isIntake
+                      ? "本次追加需求仍保留，点击「运行」可重新让评审梳理，不会丢失已输入内容。"
+                      : "历史数据与当前进度均保留，可点击「运行」重试当前步骤。"
+                  }}
+                </div>
+                <div v-if="isIntake && task.followup_requirement" class="hp-reason">
+                  <div class="hp-label">待梳理的追加需求</div>
+                  <div class="hp-reason-text">{{ task.followup_requirement }}</div>
+                </div>
+                <div class="hp-actions">
+                  <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doRun">
+                    运行 / 重试
+                  </button>
+                </div>
+              </div>
+            </template>
+            <template v-else-if="isCompleted">
+              <div class="human-panel completed-panel">
+                <div class="hp-head">
+                  <span class="badge badge-green">✅ 任务已完成</span>
+                  <b>可以继续提出新的问题或需求</b>
+                  <span class="hp-round">共 {{ subtasks.length }} 个模块</span>
+                </div>
+                <div class="hp-text">
+                  所有模块已通过全局评审。你可以继续输入新的需求，评审者会先梳理增量：
+                  <b>简单改动只创建 1 个子任务</b>，避免重复拆解和过度设计；复杂需求才拆成少量模块。
+                </div>
+                <div class="hp-actions">
+                  <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="openFollowup">
+                    ＋ 追加需求，继续迭代
+                  </button>
+                </div>
+                <div class="hp-hint">
+                  已有代码、模块摘要和评审历史全部保留，不会重跑已完成模块。
                 </div>
               </div>
             </template>
@@ -1087,14 +1244,26 @@ onUnmounted(() => {
           <div v-else-if="isGlobal" class="global-view">
             <div class="current-head">
               <div>
-                <div class="t">全局评审收口阶段</div>
+                <div class="t">
+                  {{ isCompleted ? "全局评审收口完成" : "全局评审收口阶段" }}
+                </div>
                 <div class="s">
-                  第 {{ task.current_global_round }} / {{ task.global_max_round }} 轮 ·
+                  第 {{ task.global_review_cycle }} 次迭代 · 第
+                  {{ task.current_global_round }} / {{ task.global_max_round }} 轮 ·
                   上下文 = 全局契约 + 所有模块摘要 + 全部模块 diff 汇总
                 </div>
               </div>
-              <span class="badge badge-yellow right">
-                {{ task.status === "needs_human" ? "等待人工介入" : "评审中" }}
+              <span
+                class="badge right"
+                :class="isCompleted ? 'badge-green' : 'badge-yellow'"
+              >
+                {{
+                  isCompleted
+                    ? "✅ 已完成"
+                    : task.status === "needs_human"
+                      ? "等待人工介入"
+                      : "评审中"
+                }}
               </span>
             </div>
 
@@ -1108,7 +1277,9 @@ onUnmounted(() => {
               class="global-round-card"
             >
               <div class="gh">
-                <span class="badge badge-blue">全局第 {{ rec.round }} 轮</span>
+                <span class="badge badge-blue">
+                  第 {{ rec.cycle || 1 }} 次迭代 · 全局第 {{ rec.round }} 轮
+                </span>
                 <span class="decision" :class="rec.passed ? 'pass' : 'reject'">
                   {{ rec.passed ? "✅ 通过" : "❌ 不通过" }}
                 </span>
@@ -1272,6 +1443,14 @@ onUnmounted(() => {
               @click="showRequirements = true"
             >
               编辑
+            </button>
+            <button
+              v-else-if="isCompleted"
+              class="btn btn-sm btn-ghost"
+              style="margin-left: auto"
+              @click="openFollowup"
+            >
+              ＋ 追加需求
             </button>
           </div>
           <div class="contract-box">
@@ -1478,6 +1657,14 @@ onUnmounted(() => {
       :task="task"
       @close="showRequirements = false"
       @saved="onRequirementsSaved"
+    />
+
+    <FollowUpModal
+      v-if="showFollowup && task"
+      :task="task"
+      :subtask-count="subtasks.length"
+      @close="showFollowup = false"
+      @queued="onFollowupQueued"
     />
 
     <div v-if="showConsole" class="modal-mask" @click.self="showConsole = false">

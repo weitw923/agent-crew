@@ -351,6 +351,12 @@ fn run_loop(
             }
         }
 
+        // 已完成任务追加需求：先由评审做增量梳理，不重新拆解整个项目。
+        if task.task_phase == "requirement_intake" {
+            do_requirement_intake(app, &conn, db_path, &settings, &mut task)?;
+            continue;
+        }
+
         // 拆解恢复保护：只要还没有全局契约且没有任何子任务，就一定是拆解未完成
         //（包括旧版本在 planning 阶段失败后只把 status 恢复成 running 的情况），
         // 此时必须重新拆解，不能直接进入模块队列检查。
@@ -730,6 +736,251 @@ fn validate_plan(value: Value) -> Result<PlannerOutput, String> {
         }
     }
     Ok(plan)
+}
+
+// ------------------------------------------------------------------
+// 阶段 1.5：已完成任务追加需求（增量梳理）
+// ------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+struct IntakeOutput {
+    decision: String,
+    #[serde(default)]
+    analysis: String,
+    subtasks: Vec<PlannerItem>,
+}
+
+fn validate_intake(
+    value: Value,
+    existing_names: &[String],
+    force_single: bool,
+) -> Result<IntakeOutput, String> {
+    let out: IntakeOutput = serde_json::from_value(value)
+        .map_err(|e| format!("JSON 结构不符合增量需求梳理约定: {e}"))?;
+    let decision = out.decision.trim().to_lowercase();
+    if decision != "simple" && decision != "complex" {
+        return Err("decision 必须是 simple 或 complex".into());
+    }
+    if out.analysis.trim().is_empty() {
+        return Err("analysis 梳理结论不能为空".into());
+    }
+    if force_single && decision != "simple" {
+        return Err("用户要求单模块快改时，decision 必须为 simple".into());
+    }
+    if force_single && out.subtasks.len() != 1 {
+        return Err("用户要求单模块快改时，subtasks 必须恰好 1 个".into());
+    }
+    if decision == "simple" && out.subtasks.len() != 1 {
+        return Err("简单需求必须只输出 1 个子任务，禁止过度拆解".into());
+    }
+    if decision == "complex" && !(2..=6).contains(&out.subtasks.len()) {
+        return Err("复杂需求必须拆成 2-6 个子任务".into());
+    }
+    if out.subtasks.is_empty() {
+        return Err("subtasks 不能为空".into());
+    }
+    if out.subtasks.len() > 6 {
+        return Err("本次增量最多 6 个子任务，请合并相近的改动".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for item in &out.subtasks {
+        let name = item.name.trim();
+        if name.is_empty() {
+            return Err("存在空的子任务名称".into());
+        }
+        if item.accept_criteria.trim().is_empty() {
+            return Err(format!("子任务「{name}」缺少验收标准"));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(format!("子任务名称重复：{name}"));
+        }
+        if existing_names.iter().any(|n| n.trim() == name) {
+            return Err(format!("子任务名称与已完成模块重复：{name}"));
+        }
+    }
+    Ok(out)
+}
+
+fn do_requirement_intake(
+    app: Option<&AppHandle>,
+    conn: &Connection,
+    db_path: &Path,
+    settings: &AppSettings,
+    task: &mut TaskMain,
+) -> Result<(), String> {
+    let requirement = task.followup_requirement.trim().to_string();
+    if requirement.is_empty() {
+        return Err("没有待梳理的追加需求".into());
+    }
+    let reviewer = db::get_agent(conn, task.reviewer_agent_id)?
+        .ok_or_else(|| "评审 Agent 不存在".to_string())?;
+    if reviewer.role_type != "reviewer" {
+        return Err("任务绑定的 Agent 不是 Reviewer".into());
+    }
+    let force_single = task.followup_mode == "single";
+    log(
+        app,
+        conn,
+        task.id,
+        "info",
+        if force_single {
+            "评审开始梳理追加需求（单模块快改模式）：只创建一个子任务…"
+        } else {
+            "评审开始梳理追加需求：自动判断简单改动或复杂需求…"
+        },
+    );
+    record_event(
+        app,
+        conn,
+        task.id,
+        None,
+        "agent_message:reviewer",
+        &format!(
+            "收到追加需求：{}\n\n开始梳理增量范围；简单改动只创建 1 个子任务，不重新拆解已完成项目。",
+            prompts::truncate_chars(&requirement, 3000)
+        ),
+    );
+
+    let subtasks = db::list_subtasks(conn, task.id)?;
+    let completed = db::completed_summaries(&subtasks);
+    let existing_names = subtasks
+        .iter()
+        .map(|s| s.subtask_name.trim().to_string())
+        .collect::<Vec<_>>()
+        .join("；");
+    let human = human_instructions(app, conn, task.id);
+    let base_user = prompts::requirement_intake_user(
+        &task.task_name,
+        &task.top_requirement,
+        &task.global_accept_criteria,
+        &task.tech_stack,
+        &task.global_contract,
+        &completed,
+        &existing_names,
+        &requirement,
+        &human,
+        force_single,
+    );
+    let mut user = base_user.clone();
+    let mut parsed: Option<IntakeOutput> = None;
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let system = agent_system(&reviewer, &prompts::requirement_intake_system());
+        let value = llm_json(
+            app,
+            conn,
+            task.id,
+            None,
+            "requirement_intake",
+            &reviewer,
+            &system,
+            &user,
+            &settings.llm_timeout_sec,
+        )?;
+        match validate_intake(
+            value,
+            &subtasks
+                .iter()
+                .map(|s| s.subtask_name.clone())
+                .collect::<Vec<_>>(),
+            force_single,
+        ) {
+            Ok(out) => {
+                parsed = Some(out);
+                break;
+            }
+            Err(e) => {
+                last_error = e.clone();
+                log(
+                    app,
+                    conn,
+                    task.id,
+                    "warn",
+                    &format!("追加需求梳理输出不合法（第 {} 次）：{}", attempt + 1, e),
+                );
+                user = format!(
+                    "{base_user}\n\n注意：你上一次输出不符合要求：{e}。请修正后重新只输出合法 JSON。"
+                );
+            }
+        }
+    }
+    let output = parsed.ok_or_else(|| format!("追加需求梳理多次校验失败：{last_error}"))?;
+    let decision = output.decision.trim().to_lowercase();
+    let items = output
+        .subtasks
+        .iter()
+        .map(|i| {
+            (
+                i.name.trim().to_string(),
+                i.accept_criteria.trim().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    record_event(
+        app,
+        conn,
+        task.id,
+        None,
+        "agent_message:reviewer",
+        &format!(
+            "追加需求梳理完成（{}）：{}\n本次新增 {} 个子任务：{}",
+            if decision == "simple" {
+                "简单改动 · 单模块"
+            } else {
+                "复杂需求 · 少量模块"
+            },
+            output.analysis.trim(),
+            items.len(),
+            output
+                .subtasks
+                .iter()
+                .map(|i| i.name.trim().to_string())
+                .collect::<Vec<_>>()
+                .join("；")
+        ),
+    );
+
+    let mut conn_tx = db::open(db_path)?;
+    let new_subtasks = db::apply_followup_requirement(
+        &mut conn_tx,
+        task,
+        &requirement,
+        output.analysis.trim(),
+        &items,
+    )?;
+    record_event(
+        app,
+        conn,
+        task.id,
+        None,
+        "requirement_accepted",
+        &format!(
+            "追加需求已落成 {} 个新子任务，从模块 #{} 继续串行开发；原已完成模块不会重跑。",
+            items.len(),
+            new_subtasks
+                .iter()
+                .filter(|s| s.status == "waiting")
+                .map(|s| s.sort_index)
+                .min()
+                .unwrap_or_default()
+        ),
+    );
+    log(
+        app,
+        conn,
+        task.id,
+        "info",
+        &format!(
+            "追加需求梳理完成：{}，新增 {} 个子任务，继续交给 Coder 开发",
+            if decision == "simple" {
+                "简单改动只创建 1 个模块"
+            } else {
+                "复杂需求拆成少量模块"
+            },
+            items.len()
+        ),
+    );
+    Ok(())
 }
 
 // ------------------------------------------------------------------
@@ -1779,6 +2030,7 @@ fn do_global_step(
     // 只有本轮评审成功产出合法 JSON 才消耗全局轮次，避免网络/解析失败偷跑轮次。
     task.current_global_round = next_round;
     let record = GlobalReviewRecord {
+        cycle: task.global_review_cycle.max(1),
         round: task.current_global_round,
         passed: output.passed,
         feedback: output.feedback.trim().to_string(),
@@ -2802,6 +3054,106 @@ fn orchestrator_spawn(app: &AppHandle, task_id: i64) -> Result<(), String> {
     spawn_task(app.clone(), task_id)
 }
 
+/// 任务完成后追加新需求：由评审先梳理增量，再继续派发 Coder。
+/// simple 只创建一个子任务；complex 也限制在少量模块，避免重复过度设计。
+pub fn append_requirement(
+    app: Option<&AppHandle>,
+    task_id: i64,
+    requirement: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let handle = app.ok_or_else(|| "缺少 UI 上下文".to_string())?;
+    let requirement = requirement.trim();
+    if requirement.is_empty() {
+        return Err("新需求不能为空".into());
+    }
+    if requirement.chars().count() > 12_000 {
+        return Err("新需求过长，请控制在 12000 字以内".into());
+    }
+    if !matches!(mode, "auto" | "single") {
+        return Err("追加需求模式必须是 auto 或 single".into());
+    }
+    let db_path = handle.state::<AppState>().db_path()?;
+    let conn = db::open(&db_path)?;
+    let mut task = db::get_task(&conn, task_id)?.ok_or_else(|| "任务不存在".to_string())?;
+    if task.status != "completed" {
+        return Err("只有已完成的任务才支持追加新需求".into());
+    }
+    if task.task_phase == "requirement_intake" {
+        return Err("当前已有追加需求正在梳理".into());
+    }
+    task.followup_requirement = requirement.to_string();
+    task.followup_mode = mode.to_string();
+    task.task_phase = "requirement_intake".into();
+    task.status = "planning".into();
+    task.pause_reason.clear();
+    task.cancel_requested = false;
+    task.start_requested = false;
+    task.schedule_override = task.execution_mode == "scheduled";
+    db::save_task(&conn, &task)?;
+    record_event(
+        Some(handle),
+        &conn,
+        task_id,
+        None,
+        "requirement_queued",
+        &format!(
+            "任务完成后追加新需求（{}）：\n{}",
+            if mode == "single" {
+                "单模块快改"
+            } else {
+                "自动判断"
+            },
+            prompts::truncate_chars(requirement, 4000)
+        ),
+    );
+    log(
+        Some(handle),
+        &conn,
+        task_id,
+        "warn",
+        &format!(
+            "收到追加需求（{}），评审将先梳理增量：简单改动只创建 1 个子任务，不重新拆解已完成项目",
+            if mode == "single" {
+                "单模块快改"
+            } else {
+                "自动判断"
+            }
+        ),
+    );
+
+    let settings = db::get_settings(&conn)?;
+    if running_count(handle) >= max_concurrent(&settings) {
+        task.status = "pending".into();
+        task.start_requested = true;
+        task.pause_reason = "concurrency".into();
+        db::save_task(&conn, &task)?;
+        log(
+            Some(handle),
+            &conn,
+            task_id,
+            "warn",
+            &format!(
+                "已达到最大并发任务数（{}），追加需求进入等待队列，有空位后自动开始梳理",
+                max_concurrent(&settings)
+            ),
+        );
+        emit_update(Some(handle), task_id);
+        return Ok(());
+    }
+    drop(conn);
+    if let Err(e) = spawn_task(handle.clone(), task_id) {
+        if let Ok(conn) = db::open(&db_path) {
+            if let Ok(Some(mut failed)) = db::get_task(&conn, task_id) {
+                failed.status = "failed".into();
+                let _ = db::save_task(&conn, &failed);
+            }
+        }
+        return Err(format!("追加需求后启动调度失败：{e}"));
+    }
+    Ok(())
+}
+
 /// 人工点击【运行】：立即执行 / 稍后执行 / 定时执行都从这里进入。
 /// 并发上限已满时会转为等待队列，不会静默超发。
 pub fn start_task(app: &AppHandle, task_id: i64) -> Result<StartOutcome, String> {
@@ -3101,6 +3453,7 @@ pub fn global_human_force_pass(app: Option<&AppHandle>, task_id: i64) -> Result<
     }
     let round = task.current_global_round.max(1);
     task.global_review_records.push(GlobalReviewRecord {
+        cycle: task.global_review_cycle.max(1),
         round,
         passed: true,
         feedback: "人工强制通过全局评审，任务收口完成".into(),
@@ -3145,6 +3498,7 @@ pub fn global_human_rework(
 
     let round = task.current_global_round.max(1);
     task.global_review_records.push(GlobalReviewRecord {
+        cycle: task.global_review_cycle.max(1),
         round,
         passed: false,
         feedback: "人工指定模块返工".into(),
@@ -3188,7 +3542,42 @@ pub fn global_human_rework(
 
 #[cfg(test)]
 mod tests {
-    use super::should_replan;
+    use super::{should_replan, validate_intake};
+    use serde_json::json;
+
+    fn intake(decision: &str, names: &[&str]) -> serde_json::Value {
+        json!({
+            "decision": decision,
+            "analysis": "测试梳理结论",
+            "subtasks": names
+                .iter()
+                .map(|n| json!({ "name": n, "accept_criteria": "可验证的验收标准" }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn simple_followup_must_keep_exactly_one_subtask() {
+        assert!(validate_intake(intake("simple", &["导出模块"]), &[], false).is_ok());
+        assert!(validate_intake(intake("simple", &["导出模块", "样式模块"]), &[], false).is_err());
+        assert!(validate_intake(intake("simple", &["导出模块"]), &[], true).is_ok());
+        assert!(validate_intake(intake("complex", &["导出模块"]), &[], true).is_err());
+    }
+
+    #[test]
+    fn complex_followup_is_capped_and_cannot_reuse_completed_names() {
+        assert!(validate_intake(intake("complex", &["模块A", "模块B"]), &[], false).is_ok());
+        assert!(validate_intake(
+            intake(
+                "complex",
+                &["模块A", "模块B", "模块C", "模块D", "模块E", "模块F", "模块G"]
+            ),
+            &[],
+            false
+        )
+        .is_err());
+        assert!(validate_intake(intake("simple", &["旧模块"]), &["旧模块".into()], false).is_err());
+    }
 
     #[test]
     fn replans_only_when_contract_and_subtasks_are_missing() {

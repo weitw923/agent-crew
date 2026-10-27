@@ -1862,3 +1862,58 @@ html[data-theme="light"] .terminated-panel {
     margin-left: 0;
   }
 }
+
+/* ---------------- V2.2：任务完成后的追加需求 ---------------- */
+.completed-panel {
+  border-color: rgba(63, 185, 80, 0.32);
+  background: rgba(63, 185, 80, 0.06);
+}
+.completed-panel .hp-head b {
+  color: var(--text);
+}
+.completed-panel .hp-text {
+  color: var(--text-2);
+}
+.followup-context {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  border: 1px solid var(--line-soft);
+  background: var(--bg-soft);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.followup-context b {
+  font-size: 13px;
+}
+.followup-counter {
+  align-self: flex-end;
+  color: var(--muted-2);
+  font-size: 10.5px;
+}
+.followup-counter.over {
+  color: var(--red);
+}
+.followup-modes {
+  grid-template-columns: repeat(2, 1fr);
+}
+.followup-note {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  background: rgba(107, 140, 255, 0.075);
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+html[data-theme="light"] .completed-panel {
+  border-color: rgba(31, 143, 57, 0.28);
+  background: rgba(31, 143, 57, 0.055);
+}
+@media (max-width: 640px) {
+  .followup-modes {
+    grid-template-columns: 1fr;
+  }
+}

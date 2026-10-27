@@ -11,7 +11,8 @@ export type TaskStatus =
   | "completed"
   | "failed";
 export type ExecutionMode = "immediate" | "later" | "scheduled";
-export type TaskPhase = "plan_approval" | "module_dev" | "global_review";
+export type TaskPhase = "plan_approval" | "module_dev" | "global_review" | "requirement_intake";
+export type FollowupMode = "auto" | "single";
 export type SubtaskStatus = "waiting" | "in_progress" | "completed" | "needs_human";
 export type SubtaskStage =
   | "queued"
@@ -67,6 +68,7 @@ export interface GlobalReviewIssue {
 }
 
 export interface GlobalReviewRecord {
+  cycle: number;
   round: number;
   passed: boolean;
   feedback: string;
@@ -105,6 +107,7 @@ export interface TaskMain {
   status: TaskStatus;
   work_dir: string;
   current_global_round: number;
+  global_review_cycle: number;
   global_review_records: GlobalReviewRecord[];
   create_time: string;
   manual_review_enabled: boolean;
@@ -118,6 +121,8 @@ export interface TaskMain {
   schedule_override: boolean;
   start_requested: boolean;
   pause_reason: string;
+  followup_requirement: string;
+  followup_mode: FollowupMode;
 }
 
 export interface TaskLog {

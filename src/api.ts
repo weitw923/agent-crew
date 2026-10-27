@@ -4,6 +4,7 @@ import type {
   AgentInput,
   AppSettings,
   ChatMessage,
+  FollowupMode,
   NewTaskInput,
   RuntimeConfigInput,
   StartOutcome,
@@ -25,6 +26,11 @@ export const listTasks = () => invoke<TaskSummary[]>("list_tasks");
 export const createTask = (input: NewTaskInput) => invoke<number>("create_task", { input });
 export const startTask = (taskId: number) => invoke<StartOutcome>("start_task", { taskId });
 export const resumeTask = (taskId: number) => invoke<void>("resume_task", { taskId });
+export const appendRequirement = (
+  taskId: number,
+  requirement: string,
+  mode: FollowupMode = "auto"
+) => invoke<void>("append_requirement", { taskId, requirement, mode });
 export const getTaskDetail = (taskId: number) => invoke<TaskDetail>("get_task_detail", { taskId });
 export const listTaskEvents = (taskId: number) =>
   invoke<TaskEvent[]>("list_task_events", { taskId });

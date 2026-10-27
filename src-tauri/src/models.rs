@@ -51,6 +51,9 @@ pub struct GlobalReviewIssue {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlobalReviewRecord {
+    /// 第几次任务迭代（首次完成=1；每次追加需求后 +1），用于区分多轮全局评审。
+    #[serde(default = "default_review_cycle")]
+    pub cycle: i64,
     pub round: i64,
     pub passed: bool,
     pub feedback: String,
@@ -73,6 +76,9 @@ pub struct TaskMain {
     pub status: String, // pending / planning / running / needs_human / paused / terminated / completed / failed
     pub work_dir: String,
     pub current_global_round: i64,
+    /// 当前任务迭代轮次：首次任务=1，每次完成后追加需求再 +1。
+    #[serde(default = "default_review_cycle")]
+    pub global_review_cycle: i64,
     pub global_review_records: Vec<GlobalReviewRecord>,
     pub create_time: String,
     /// 任务启动时的 git tree 快照，用于计算整个项目的累计 diff（额外内部字段）。
@@ -109,6 +115,20 @@ pub struct TaskMain {
     /// 暂停原因：manual / waiting_window / concurrency / terminated。
     #[serde(default)]
     pub pause_reason: String,
+    /// 已完成任务追加的新需求；评审梳理期间暂存，落成子任务后清空。
+    #[serde(default)]
+    pub followup_requirement: String,
+    /// 追加需求模式：auto 自动判断 / single 强制单模块快改。
+    #[serde(default = "default_followup_mode")]
+    pub followup_mode: String,
+}
+
+pub fn default_review_cycle() -> i64 {
+    1
+}
+
+pub fn default_followup_mode() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

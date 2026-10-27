@@ -113,6 +113,17 @@ fn build_mock_response(
     if body.contains("临时问答会话") || body.contains("用户最新问题") {
         return "临时问答回复：建议继续保持 JWT + 统一返回体，不要启动新的开发任务。".to_string();
     }
+    // 已完成任务追加需求：增量梳理。
+    if body.contains("增量需求评审者") {
+        return serde_json::json!({
+            "decision": "simple",
+            "analysis": "本次只是增加一个导出入口，可在现有页面内完成，不需要拆分多个模块。",
+            "subtasks": [
+                { "name": "计划导出模块", "accept_criteria": "在现有日历页提供导出入口，按当前计划内容生成 Markdown 文件，并复用统一返回体。" }
+            ]
+        })
+        .to_string();
+    }
     // Planner：system prompt 中的关键词。
     if body.contains("软件架构评审者") || body.contains("请输出拆解 JSON") {
         return serde_json::json!({
@@ -368,6 +379,61 @@ fn full_serial_orchestration_flow() {
     assert!(work_dir.join("src").is_dir());
     // 摘要最终快照已移到项目外，项目目录不再残留 summaries。
     assert!(!work_dir.join("summaries").is_dir());
+
+    drop(detail);
+    drop(conn);
+
+    // 任务完成后追加一个简单需求：评审应只创建一个子任务，不重新拆解已有模块。
+    let conn = db::open(&db_path).unwrap();
+    let mut task = db::get_task(&conn, task_id).unwrap().unwrap();
+    task.followup_requirement = "给日历页增加导出当日计划为 Markdown 的按钮".into();
+    task.followup_mode = "auto".into();
+    task.task_phase = "requirement_intake".into();
+    task.status = "planning".into();
+    db::save_task(&conn, &task).unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id)
+        .expect("follow-up requirement should complete");
+
+    let conn = db::open(&db_path).unwrap();
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "completed");
+    assert_eq!(
+        detail.task.global_review_cycle, 2,
+        "follow-up starts a new review cycle"
+    );
+    assert_eq!(
+        detail.subtasks.len(),
+        3,
+        "simple follow-up must add exactly one module"
+    );
+    assert!(
+        detail.task.top_requirement.contains("追加需求"),
+        "top requirement should keep follow-up history"
+    );
+    assert!(detail.task.followup_requirement.is_empty());
+    let followup = detail
+        .subtasks
+        .iter()
+        .find(|s| s.sort_index == 3)
+        .expect("new follow-up module");
+    assert_eq!(followup.subtask_name, "计划导出模块");
+    assert_eq!(followup.status, "completed");
+    assert_eq!(followup.current_round, 1);
+    assert!(!followup.summary_content.is_empty());
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.kind == "requirement_accepted"),
+        "follow-up intake should be recorded"
+    );
+    assert_eq!(
+        detail.task.global_review_records.last().unwrap().cycle,
+        2,
+        "new global review record should belong to cycle 2"
+    );
 }
 
 /// 人工审核模式：方案审批 + 逐模块设计审批 + 人工消息注入。

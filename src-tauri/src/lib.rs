@@ -112,6 +112,7 @@ pub fn run() {
             commands::create_task,
             commands::start_task,
             commands::resume_task,
+            commands::append_requirement,
             commands::get_task_detail,
             commands::list_task_events,
             commands::delete_task,
