@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import MarkdownView from "./MarkdownView.vue";
+import { stripDuplicateHeading } from "../markdown";
 import type { Iteration, PreviewPayload, Subtask, TaskMain } from "../types";
 
 const props = defineProps<{
@@ -15,6 +17,9 @@ const emit = defineEmits<{
 }>();
 
 const hasPreview = computed(() => !!props.preview);
+const previewMarkdown = computed(() =>
+  props.preview ? stripDuplicateHeading(props.preview.content, props.preview.title) : ""
+);
 
 function contractPreview(kind: "tech_stack" | "contract" | "requirement" | "criteria") {
   if (!props.task) return;
@@ -70,7 +75,11 @@ function contractPreview(kind: "tech_stack" | "contract" | "requirement" | "crit
         <div v-if="preview.source" class="preview-source">{{ preview.source }}</div>
         <div v-if="preview.time" class="preview-time">{{ preview.time }}</div>
       </div>
-      <pre class="preview-content">{{ preview.content || "（空）" }}</pre>
+      <!-- diff 保持原始等宽文本；其余均为 Agent 产出的 Markdown，按预览渲染。 -->
+      <pre v-if="preview.kind === 'diff'" class="preview-content">{{ preview.content || "（空）" }}</pre>
+      <div v-else class="preview-content-md">
+        <MarkdownView :content="previewMarkdown" />
+      </div>
     </div>
 
     <div v-else class="preview-empty">
@@ -138,9 +147,9 @@ function contractPreview(kind: "tech_stack" | "contract" | "requirement" | "crit
           完成摘要
         </button>
       </div>
-      <pre v-if="selectedSubtask.accept_criteria" class="pre-box" style="max-height: 120px">{{
-        selectedSubtask.accept_criteria
-      }}</pre>
+      <div v-if="selectedSubtask.accept_criteria" class="preview-criteria">
+        <MarkdownView :content="selectedSubtask.accept_criteria" />
+      </div>
     </div>
   </aside>
 </template>

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
+import { markdownToSnippet } from "../markdown";
 import type { Iteration, PreviewPayload, Subtask, TaskEvent } from "../types";
 
 const props = defineProps<{
@@ -487,7 +488,7 @@ defineExpose({ scrollToBottom });
                   <b>{{ kindText(ev) }}</b>
                   <span class="small muted">点击在右侧预览</span>
                   <pre class="timeline-preview-text"><span
-                    v-for="(seg, i) in highlight(ev.content, 260)"
+                    v-for="(seg, i) in highlight(markdownToSnippet(ev.content, 260), 260)"
                     :key="i"
                     :class="{ 'timeline-hit': seg.hit }"
                   >{{ seg.text }}</span></pre>

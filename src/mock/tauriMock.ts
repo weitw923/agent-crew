@@ -441,7 +441,59 @@ const summaries: TaskSummary[] = [
   }
 ];
 
+function mockScene() {
+  try {
+    return new URLSearchParams(location.search).get("scene") ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function planApprovalDetail(): TaskDetail {
+  const task = {
+    ...taskMain,
+    task_phase: "plan_approval" as const,
+    status: "needs_human" as const,
+    global_contract: "",
+    tech_stack: "",
+    pending_plan_json: "{}"
+  };
+  return {
+    task,
+    subtasks: [],
+    logs: [],
+    reviewer,
+    coders: [coder],
+    execution_events: [],
+    human_messages: [],
+    pending_plan: {
+      tech_stack:
+        "# 技术栈\n- 前端：Vue 3 + TypeScript + Vite\n- 状态：组件本地状态\n- 样式：原生 CSS 变量\n- 测试：Vitest\n- 构建：Vite build",
+      global_contract:
+        "# 全局契约\n1. 时间统一 ISO 字符串\n2. 组件间只通过 props / emits 通信\n3. 所有用户可见文案使用中文\n4. 样式使用 CSS 变量，支持浅色/深色主题\n\n| 约定 | 示例 |\n| --- | --- |\n| 事件名 | `schedule:create` |\n| 错误码 | `E_INVALID_TIME` |",
+      subtasks: [
+        { name: "日历视图骨架与数据模型", accept_criteria: "- 月/周视图可切换\n- 数据结构含 `title/start/end`" },
+        { name: "新建日程表单与校验", accept_criteria: "标题必填；结束时间晚于开始时间" },
+        { name: "拖拽调整日程时间", accept_criteria: "15 分钟吸附；跨天有提示" }
+      ]
+    },
+    chat_messages: [],
+    iterations: [
+      {
+        ...iterations[0],
+        status: "pending",
+        start_time: "",
+        end_time: "",
+        subtask_total: 0,
+        subtask_completed: 0,
+        duration_sec: 0
+      }
+    ]
+  };
+}
+
 function taskDetail(iterationId: number | null): TaskDetail {
+  if (mockScene() === "plan") return planApprovalDetail();
   return {
     task: taskMain,
     subtasks,
@@ -459,6 +511,20 @@ function taskDetail(iterationId: number | null): TaskDetail {
 }
 
 function iterationDetail(iterationId: number): IterationDetail {
+  if (mockScene() === "plan") {
+    const detail = planApprovalDetail();
+    return {
+      task: detail.task,
+      iteration: detail.iterations[0],
+      iterations: detail.iterations,
+      subtasks: [],
+      logs: [],
+      reviewer,
+      coders: [coder],
+      execution_events: [],
+      human_messages: []
+    };
+  }
   const iteration = iterations.find((i) => i.id === iterationId) ?? iterations[0];
   return {
     task: taskMain,

@@ -52,6 +52,16 @@ async function runScene() {
     await new Promise((r) => setTimeout(r, 400));
     return;
   }
+  if (scene === "plan") {
+    clickByText(".iteration-card .btn", "进入迭代");
+    await new Promise((r) => setTimeout(r, 600));
+    return;
+  }
+  if (scene === "md-tech") {
+    clickByText(".contract-bar .chip", "技术栈");
+    await new Promise((r) => setTimeout(r, 400));
+    return;
+  }
   if (scene === "search" || scene === "collapse" || scene === "jump") {
     await new Promise((r) => setTimeout(r, 400));
     if (scene === "search") {

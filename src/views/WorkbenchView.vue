@@ -6,6 +6,8 @@ import ChatPanel from "../components/ChatPanel.vue";
 import FollowUpModal from "../components/FollowUpModal.vue";
 import IterationList from "../components/IterationList.vue";
 import IterationTree from "../components/IterationTree.vue";
+import MarkdownView from "../components/MarkdownView.vue";
+import { stripDuplicateHeading } from "../markdown";
 import PreviewPanel from "../components/PreviewPanel.vue";
 import RequirementsModal from "../components/RequirementsModal.vue";
 import RuntimeConfigModal from "../components/RuntimeConfigModal.vue";
@@ -1063,14 +1065,29 @@ onUnmounted(() => {
             <div class="round-block">
               <div class="head">技术栈</div>
               <div class="body">
-                <pre class="pre-box" style="max-height: 160px">{{ pendingPlan?.tech_stack || task.tech_stack || "（未提供）" }}</pre>
+                <div class="md-scroll">
+                  <MarkdownView
+                    :content="stripDuplicateHeading(pendingPlan?.tech_stack || task.tech_stack || '', '技术栈')"
+                    placeholder="（未提供）"
+                  />
+                </div>
               </div>
             </div>
 
             <div class="round-block">
               <div class="head">全局契约</div>
               <div class="body">
-                <pre class="pre-box" style="max-height: 260px">{{ pendingPlan?.global_contract || task.global_contract || "（未提供）" }}</pre>
+                <div class="md-scroll">
+                  <MarkdownView
+                    :content="
+                      stripDuplicateHeading(
+                        pendingPlan?.global_contract || task.global_contract || '',
+                        '全局契约'
+                      )
+                    "
+                    placeholder="（未提供）"
+                  />
+                </div>
               </div>
             </div>
 
