@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref } from "vue";
 import AgentsView from "./views/AgentsView.vue";
 import TasksView from "./views/TasksView.vue";
 import WorkbenchView from "./views/WorkbenchView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import { toasts } from "./toast";
+import { initTheme, theme, toggleTheme } from "./theme";
 
 type TabKey = "agents" | "tasks" | "workbench" | "settings";
 
@@ -20,6 +21,8 @@ function switchTab(tab: TabKey) {
   // 没有打开过任务时，工作台 Tab 只显示引导页。
   activeTab.value = tab;
 }
+
+onMounted(initTheme);
 </script>
 
 <template>
@@ -65,8 +68,15 @@ function switchTab(tab: TabKey) {
       </nav>
 
       <div class="topbar-right">
+        <button
+          class="theme-toggle"
+          :title="theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'"
+          @click="toggleTheme"
+        >
+          {{ theme === "dark" ? "☀ 浅色" : "☾ 深色" }}
+        </button>
         <span class="dot"></span>
-        <span>本地 SQLite · 数据不上云</span>
+        <span>本地存储 · 数据不上云</span>
       </div>
     </header>
 

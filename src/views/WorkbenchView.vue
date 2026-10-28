@@ -1,21 +1,44 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import SubtaskCard from "../components/SubtaskCard.vue";
-import type { Subtask, TaskDetail, TaskEvent } from "../types";
+import ActionDock from "../components/ActionDock.vue";
+import ChatPanel from "../components/ChatPanel.vue";
+import FollowUpModal from "../components/FollowUpModal.vue";
+import IterationList from "../components/IterationList.vue";
+import IterationTree from "../components/IterationTree.vue";
+import MarkdownView from "../components/MarkdownView.vue";
+import { stripDuplicateHeading } from "../markdown";
+import PreviewPanel from "../components/PreviewPanel.vue";
+import RequirementsModal from "../components/RequirementsModal.vue";
+import RuntimeConfigModal from "../components/RuntimeConfigModal.vue";
+import TimelinePanel from "../components/TimelinePanel.vue";
+import type {
+  IterationDetail,
+  PreviewPayload,
+  RuntimeConfigInput,
+  Subtask,
+  TaskDetail,
+  TaskEvent,
+  TaskMain
+} from "../types";
 import {
   approveDesign,
   approvePlan,
-  cancelTask,
+  extendSubtaskRounds,
+  getIterationDetail,
   getTaskDetail,
+  listTaskEvents,
   globalHumanForcePass,
   globalHumanRework,
   humanForcePass,
   humanReject,
+  pauseTask,
   rejectDesign,
   rejectPlan,
   resumeTask,
   sendHumanMessage,
+  startTask,
+  terminateTask,
   updateTaskConfig
 } from "../api";
 import { errorMessage, showToast } from "../toast";
@@ -27,9 +50,21 @@ const emit = defineEmits<{
 }>();
 
 const detail = ref<TaskDetail | null>(null);
-const selectedSubtaskId = ref<number | null>(null);
+const iterDetail = ref<IterationDetail | null>(null);
 const loading = ref(false);
 const actionBusy = ref(false);
+
+/** 任务详情第一屏：按版本倒序的迭代列表；点击某个迭代后才进入工作台。 */
+const showIterationList = ref(true);
+const activeIterationId = ref<number | null>(null);
+const selectedSubtaskId = ref<number | null>(null);
+
+/** 右栏预览内容。 */
+const preview = ref<PreviewPayload | null>(null);
+/** 中栏时间线只看某个子任务（左栏「查看」）。 */
+const focusSubtaskId = ref<number | null>(null);
+/** 工具调用默认收起。 */
+const showTools = ref(false);
 
 const showReject = ref(false);
 const rejectText = ref("");
@@ -42,19 +77,137 @@ const globalTargetId = ref<number>(0);
 const globalFeedback = ref("");
 
 const showConfig = ref(false);
-const configForm = reactive({
-  module_max_round: 3,
-  global_max_round: 2,
-  manual_review_enabled: false
-});
+const showChat = ref(false);
+const showRequirements = ref(false);
+const showFollowup = ref(false);
 
 const humanMessage = ref("");
-const contractOpen = ref(true);
-const techStackOpen = ref(true);
-const openSummaryIds = ref<Set<number>>(new Set());
-const logBox = ref<HTMLElement | null>(null);
-const eventBox = ref<HTMLElement | null>(null);
+const allEvents = ref<TaskEvent[]>([]);
 const showConsole = ref(false);
+const logBox = ref<HTMLElement | null>(null);
+
+/* ---------------- 三栏宽度：可拖动 + 本地记忆 ---------------- */
+const LEFT_DEFAULT = 330;
+const RIGHT_DEFAULT = 400;
+const LEFT_MIN = 240;
+const LEFT_MAX = 560;
+const RIGHT_MIN = 280;
+const RIGHT_MAX = 780;
+/** 中栏（对话）最小宽度，拖到极限时优先保证它。 */
+const MID_MIN = 380;
+const RESIZER_TOTAL = 12;
+const LAYOUT_KEY = "agentcrew-wb-layout";
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), Math.max(min, max));
+}
+
+const columnsRef = ref<HTMLElement | null>(null);
+const leftWidth = ref(LEFT_DEFAULT);
+const rightWidth = ref(RIGHT_DEFAULT);
+const columnsStyle = computed(() => ({
+  "--wb-left-w": `${leftWidth.value}px`,
+  "--wb-right-w": `${rightWidth.value}px`
+}));
+
+function columnsTotal() {
+  return columnsRef.value?.clientWidth ?? 0;
+}
+
+/** 容器变窄时按中栏最小宽度反向压缩左右栏，避免整体横向溢出。 */
+function clampWidths() {
+  const total = columnsTotal();
+  if (!total) return;
+  const room = total - MID_MIN - RESIZER_TOTAL;
+  if (leftWidth.value + rightWidth.value > room) {
+    const overflow = leftWidth.value + rightWidth.value - room;
+    const rightCut = Math.min(overflow, Math.max(0, rightWidth.value - RIGHT_MIN));
+    rightWidth.value -= rightCut;
+    const leftCut = overflow - rightCut;
+    if (leftCut > 0) leftWidth.value -= Math.min(leftCut, Math.max(0, leftWidth.value - LEFT_MIN));
+  }
+  leftWidth.value = clamp(leftWidth.value, LEFT_MIN, Math.min(LEFT_MAX, room - rightWidth.value));
+  rightWidth.value = clamp(rightWidth.value, RIGHT_MIN, Math.min(RIGHT_MAX, room - leftWidth.value));
+}
+
+function saveWidths() {
+  try {
+    localStorage.setItem(
+      LAYOUT_KEY,
+      JSON.stringify({ left: leftWidth.value, right: rightWidth.value })
+    );
+  } catch {
+    /* 忽略隐私模式下的写入失败 */
+  }
+}
+
+function loadWidths() {
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as { left?: number; right?: number };
+    if (Number.isFinite(parsed.left)) leftWidth.value = clamp(Number(parsed.left), LEFT_MIN, LEFT_MAX);
+    if (Number.isFinite(parsed.right))
+      rightWidth.value = clamp(Number(parsed.right), RIGHT_MIN, RIGHT_MAX);
+  } catch {
+    /* 使用默认值 */
+  }
+}
+
+let stopResize: (() => void) | null = null;
+
+function startResize(side: "left" | "right", event: PointerEvent) {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startLeft = leftWidth.value;
+  const startRight = rightWidth.value;
+  const total = columnsTotal();
+  if (!total) return;
+  const room = total - MID_MIN - RESIZER_TOTAL;
+  const prevCursor = document.body.style.cursor;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  const move = (ev: PointerEvent) => {
+    if (side === "left") {
+      const raw = startLeft + (ev.clientX - startX);
+      leftWidth.value = clamp(raw, LEFT_MIN, Math.min(LEFT_MAX, room - startRight));
+    } else {
+      const raw = startRight - (ev.clientX - startX);
+      rightWidth.value = clamp(raw, RIGHT_MIN, Math.min(RIGHT_MAX, room - startLeft));
+    }
+  };
+  const up = () => {
+    document.body.style.cursor = prevCursor;
+    document.body.style.userSelect = "";
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    stopResize = null;
+    saveWidths();
+  };
+  stopResize = up;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
+function resetWidths() {
+  stopResize?.();
+  leftWidth.value = LEFT_DEFAULT;
+  rightWidth.value = RIGHT_DEFAULT;
+  clampWidths();
+  saveWidths();
+}
+
+let columnsObserver: ResizeObserver | null = null;
+
+// columnsRef 只在进入工作台（非迭代列表）后才存在：出现时再挂观察器
+watch(columnsRef, (el) => {
+  columnsObserver?.disconnect();
+  if (!el) return;
+  columnsObserver ??= new ResizeObserver(() => clampWidths());
+  columnsObserver.observe(el);
+  clampWidths();
+});
 
 let unlisten: UnlistenFn | null = null;
 let eventUnlisten: UnlistenFn | null = null;
@@ -62,76 +215,187 @@ let pollTimer: number | null = null;
 let reloadTimer: number | null = null;
 
 const task = computed(() => detail.value?.task ?? null);
-const subtasks = computed<Subtask[]>(() => detail.value?.subtasks ?? []);
+const iterations = computed(() => detail.value?.iterations ?? []);
+const currentIteration = computed(
+  () => iterations.value.find((i) => i.id === activeIterationId.value) ?? null
+);
+/** 工作台作用域：只包含当前迭代的子任务 / 事件 / 日志。 */
+const subtasks = computed<Subtask[]>(() => iterDetail.value?.subtasks ?? []);
+const executionEvents = computed<TaskEvent[]>(() => iterDetail.value?.execution_events ?? []);
+const logs = computed(() => iterDetail.value?.logs ?? []);
+const isLatestIteration = computed(() => {
+  if (!iterations.value.length) return true;
+  const ordered = [...iterations.value].sort(
+    (a, b) => a.major - b.major || a.minor - b.minor || a.id - b.id
+  );
+  return ordered[ordered.length - 1].id === activeIterationId.value;
+});
 const isGlobal = computed(() => task.value?.task_phase === "global_review");
 const isPlanApproval = computed(() => task.value?.task_phase === "plan_approval");
+const isCompleted = computed(() => task.value?.status === "completed");
 const isRunning = computed(
   () => task.value?.status === "running" || task.value?.status === "planning"
 );
 const selected = computed(
   () => subtasks.value.find((s) => s.id === selectedSubtaskId.value) ?? null
 );
-const completedSubtasks = computed(() => subtasks.value.filter((s) => s.status === "completed"));
-const latestRecord = computed(() => {
-  const recs = selected.value?.iteration_records ?? [];
-  return recs.length ? recs[recs.length - 1] : null;
-});
 const designGateSubtask = computed(
   () => subtasks.value.find((s) => s.current_stage === "design_approval") ?? null
 );
 const isDesignAwaiting = computed(() => !!designGateSubtask.value);
-const isDesignStage = computed(
-  () =>
-    selected.value?.current_stage === "design_generation" ||
-    selected.value?.current_stage === "design_approval"
-);
 const pendingMessages = computed(
   () => (detail.value?.human_messages ?? []).filter((m) => m.status === "pending")
 );
-const executionEvents = computed(() => detail.value?.execution_events ?? []);
-const visibleEvents = computed(() => executionEvents.value.slice(-300));
 const pendingPlan = computed(() => detail.value?.pending_plan ?? null);
+const canRun = computed(
+  () =>
+    !!task.value &&
+    (task.value.status === "pending" || task.value.status === "failed") &&
+    !isPlanApproval.value &&
+    !isDesignAwaiting.value
+);
 const canResume = computed(
   () =>
     !!task.value &&
     !isRunning.value &&
-    task.value.status !== "completed" &&
+    (task.value.status === "paused" || task.value.status === "needs_human") &&
     !isPlanApproval.value &&
     !isDesignAwaiting.value
 );
-const canCancel = computed(
-  () =>
-    !!task.value &&
-    task.value.status !== "completed" &&
-    task.value.status !== "paused" &&
-    task.value.status !== "failed"
+const canPause = computed(
+  () => !!task.value && (task.value.status === "running" || task.value.status === "planning")
 );
+const canTerminate = computed(
+  () => !!task.value && task.value.status !== "completed" && task.value.status !== "terminated"
+);
+const canContinue = computed(() => !!task.value && task.value.status === "terminated");
+
+const phaseLabel = computed(() => {
+  if (task.value?.status === "completed") return "全局评审完成";
+  const map: Record<string, string> = {
+    module_dev: "模块开发",
+    global_review: "全局评审",
+    plan_approval: "方案审批",
+    requirement_intake: "需求梳理"
+  };
+  return map[task.value?.task_phase ?? ""] ?? "模块开发";
+});
+const pendingHumanSubtask = computed(
+  () => subtasks.value.find((s) => s.status === "needs_human") ?? null
+);
+const humanTarget = computed(() => {
+  if (selected.value?.status === "needs_human") return selected.value;
+  return pendingHumanSubtask.value;
+});
 const canHuman = computed(
   () =>
     !!task.value &&
     !isRunning.value &&
     task.value.status !== "completed" &&
-    !!selected.value &&
-    (selected.value.status === "in_progress" || selected.value.status === "needs_human") &&
+    task.value.status !== "terminated" &&
+    !!humanTarget.value &&
     !isDesignAwaiting.value
 );
+const humanStageLabel = computed(() => {
+  const map: Record<string, string> = {
+    code_review: "代码评审",
+    summary_review: "摘要校验"
+  };
+  return map[humanTarget.value?.current_stage ?? ""] ?? humanTarget.value?.current_stage ?? "";
+});
+const humanActionLabel = computed(() => {
+  if (humanTarget.value?.current_stage === "code_review") return "强制通过代码评审，继续生成摘要";
+  if (humanTarget.value?.current_stage === "summary_review") return "强制通过摘要，完成模块";
+  return "人工强制通过";
+});
+const humanReason = computed(() => {
+  const target = humanTarget.value;
+  if (!target) return "";
+  const record = [...target.iteration_records]
+    .reverse()
+    .find((r) => r.review_feedback.trim() || r.review_decision);
+  return (
+    record?.review_feedback?.trim() ||
+    "该模块已达到当前轮次上限，需要人工判断是否通过、追加轮次或驳回修改。"
+  );
+});
 const statusText = computed(() => {
-  const s = task.value?.status ?? "";
+  const t = task.value;
+  if (!t) return "";
+  if (
+    t.task_phase === "requirement_intake" &&
+    (t.status === "planning" || t.status === "running")
+  )
+    return "梳理追加需求";
+  if (t.status === "pending") {
+    if (t.pause_reason === "concurrency") return "等待并发名额";
+    if (t.execution_mode === "scheduled")
+      return t.schedule_enabled ? "等待时间窗口" : "待运行（定时窗口关闭）";
+    return "待运行";
+  }
+  if (t.status === "paused" && t.pause_reason === "waiting_window") return "等待时间窗口";
+  if (t.status === "paused") return "已暂停";
   const map: Record<string, string> = {
     planning: "拆解需求中",
     running: "执行中",
     needs_human: "需要人工介入",
-    paused: "已暂停",
+    terminated: "已终止",
     completed: "已完成",
     failed: "执行失败"
   };
-  return map[s] ?? s;
+  return map[t.status] ?? t.status;
+});
+const currentIterationTokens = computed(() => {
+  const it = currentIteration.value;
+  if (!it || it.token_total < 0) return "未统计";
+  const total = it.token_total;
+  if (total >= 1_000_000) return `${(total / 1_000_000).toFixed(2)}M`;
+  if (total >= 10_000) return `${(total / 1000).toFixed(1)}k`;
+  return total.toLocaleString("en-US");
+});
+const executionModeLabel = computed(() => {
+  const map: Record<string, string> = {
+    immediate: "立即执行",
+    later: "稍后执行",
+    scheduled: "定时执行"
+  };
+  return map[task.value?.execution_mode ?? ""] ?? task.value?.execution_mode ?? "";
+});
+const scheduleText = computed(() => {
+  const t = task.value;
+  if (!t || t.execution_mode !== "scheduled") return "";
+  return `每日 ${t.schedule_start}–${t.schedule_end}${t.schedule_enabled ? "" : "（窗口关闭）"}`;
 });
 const phaseBanner = computed(() => {
   const t = task.value;
   if (!t) return { text: "", cls: "" };
-  if (t.status === "completed") return { text: "✅ 当前阶段：全部完成", cls: "done" };
+  if (t.status === "completed")
+    return { text: "✅ 当前阶段：全部完成 · 可继续追加需求", cls: "done" };
+  if (
+    t.task_phase === "requirement_intake" &&
+    (t.status === "planning" || t.status === "running")
+  )
+    return { text: "🧠 当前阶段：评审正在梳理追加需求", cls: "global" };
+  if (t.status === "terminated")
+    return { text: "⛔ 当前阶段：任务已终止，可继续任务", cls: "human" };
   if (t.status === "failed") return { text: "❌ 当前阶段：执行失败", cls: "human" };
+  if (t.status === "pending") {
+    if (t.pause_reason === "concurrency")
+      return { text: "⏳ 当前阶段：等待并发名额", cls: "global" };
+    if (t.execution_mode === "scheduled")
+      return t.schedule_enabled
+        ? {
+            text: `🕒 当前阶段：等待时间窗口 ${t.schedule_start}–${t.schedule_end}`,
+            cls: "global"
+          }
+        : { text: "⏸ 当前阶段：待运行（定时窗口关闭）", cls: "global" };
+    return { text: "⏸ 当前阶段：待运行", cls: "global" };
+  }
+  if (t.status === "paused" && t.pause_reason === "waiting_window")
+    return {
+      text: `🕒 当前阶段：窗口已结束，等待下一个 ${t.schedule_start}–${t.schedule_end} 窗口`,
+      cls: "global"
+    };
   if (t.status === "paused") return { text: "⏸ 当前阶段：已暂停，可恢复", cls: "human" };
   if (t.task_phase === "plan_approval")
     return { text: "当前阶段：等待人工审批拆解方案", cls: "global" };
@@ -145,90 +409,40 @@ const phaseBanner = computed(() => {
   if (t.status === "needs_human") return { text: "⛔ 当前阶段：等待人工介入", cls: "human" };
   return { text: "当前阶段：模块开发", cls: "" };
 });
-const stageLabel = computed(() => {
-  const map: Record<string, string> = {
-    queued: "等待派发",
-    design_generation: "Reviewer 生成模块设计中",
-    design_approval: "等待人工审批设计",
-    coding: "Coder 编码中",
-    code_review: "Reviewer 代码评审中",
-    summary_generation: "Coder 生成模块摘要中",
-    summary_review: "Reviewer 校验摘要中",
-    done: "已完成",
-    needs_human: "等待人工处理"
-  };
-  return map[selected.value?.current_stage ?? ""] ?? selected.value?.current_stage ?? "";
-});
-const subtaskStatusLabel = computed(() => {
-  const map: Record<string, string> = {
-    waiting: "等待队列中",
-    in_progress: "当前开发中",
-    completed: "已完成",
-    needs_human: "需要人工介入"
-  };
-  return map[selected.value?.status ?? ""] ?? selected.value?.status ?? "";
-});
 
-function decisionText(decision: string) {
-  if (decision === "pass") return "✅ 通过";
-  if (decision === "reject") return "❌ 不通过";
-  return "⏳ 评审中";
-}
-function feedbackText(rec: { review_decision: string; review_feedback: string } | null) {
-  if (!rec) return "";
-  if (!rec.review_decision) return "评审进行中，请稍候…";
-  return rec.review_feedback || "（无评审意见）";
-}
-function eventKindLabel(kind: string) {
-  const map: Record<string, string> = {
-    llm_request: "LLM 请求",
-    llm_response: "LLM 响应",
-    llm_error: "LLM 错误",
-    dsh_stdout: "dsh 输出",
-    dsh_stderr: "dsh stderr",
-    coder_prompt: "Coder Prompt",
-    summary_prompt: "摘要 Prompt",
-    git_diff: "Git Diff",
-    module_design: "模块设计",
-    summary_file: "摘要文件",
-    human_message: "人工消息",
-    human_message_delivered: "人工消息已注入",
-    plan_approval: "方案待审批",
-    plan_approved: "方案通过",
-    plan_rejected: "方案驳回",
-    design_approved: "设计通过",
-    design_rejected: "设计驳回",
-    config_updated: "配置更新",
-    plan_accepted: "方案确认"
-  };
-  const base = kind.includes(":") ? kind.slice(0, kind.indexOf(":")) : kind;
-  return map[base] ?? kind;
-}
-function eventKindClass(kind: string) {
-  if (kind.startsWith("llm_error") || kind === "design_rejected" || kind === "plan_rejected")
-    return "ev-error";
-  if (kind.startsWith("llm_response") || kind === "plan_approved" || kind === "design_approved")
-    return "ev-ok";
-  if (kind === "human_message" || kind === "human_message_delivered") return "ev-human";
-  if (kind.startsWith("llm_request")) return "ev-request";
-  return "";
-}
-
+// ---------------- 数据加载 ----------------
 async function load() {
   if (!props.taskId) return;
   loading.value = true;
   try {
     const d = await getTaskDetail(props.taskId);
     detail.value = d;
-    if (!showConfig.value) {
-      configForm.module_max_round = d.task.module_max_round;
-      configForm.global_max_round = d.task.global_max_round;
-      configForm.manual_review_enabled = d.task.manual_review_enabled;
+    if (!d.iterations.length || showIterationList.value) {
+      iterDetail.value = null;
+      return;
     }
+    const ordered = [...d.iterations].sort(
+      (a, b) => a.major - b.major || a.minor - b.minor || a.id - b.id
+    );
+    if (
+      activeIterationId.value == null ||
+      !d.iterations.some((i) => i.id === activeIterationId.value)
+    ) {
+      activeIterationId.value = ordered[ordered.length - 1].id;
+    }
+    const liveOnly = (iterDetail.value?.execution_events ?? []).filter((e) => e.id < 0);
+    const det = await getIterationDetail(props.taskId, activeIterationId.value);
+    if (liveOnly.length) {
+      const ids = new Set(det.execution_events.map((e) => e.id));
+      det.execution_events = [
+        ...det.execution_events,
+        ...liveOnly.filter((e) => !ids.has(e.id) && e.iteration_id === activeIterationId.value)
+      ];
+    }
+    iterDetail.value = det;
     ensureSelection();
     await nextTick();
     scrollLogs();
-    scrollEvents();
   } catch (e) {
     showToast(errorMessage(e), "error");
   } finally {
@@ -237,7 +451,7 @@ async function load() {
 }
 
 function ensureSelection() {
-  const list = detail.value?.subtasks ?? [];
+  const list = subtasks.value;
   if (!list.length) {
     selectedSubtaskId.value = null;
     return;
@@ -245,8 +459,8 @@ function ensureSelection() {
   if (selectedSubtaskId.value && list.some((s) => s.id === selectedSubtaskId.value)) return;
   const current =
     list.find((s) => s.current_stage === "design_approval") ??
-    list.find((s) => s.status === "in_progress") ??
     list.find((s) => s.status === "needs_human") ??
+    list.find((s) => s.status === "in_progress") ??
     list[0];
   selectedSubtaskId.value = current?.id ?? null;
 }
@@ -260,26 +474,141 @@ function scrollLogs() {
   const el = logBox.value;
   if (el) el.scrollTop = el.scrollHeight;
 }
-function scrollEvents() {
-  const el = eventBox.value;
-  if (el) el.scrollTop = el.scrollHeight;
-  const modal = document.querySelector(".console-modal-body") as HTMLElement | null;
-  if (modal) modal.scrollTop = modal.scrollHeight;
+
+// ---------------- 迭代导航 ----------------
+async function openIteration(id: number) {
+  activeIterationId.value = id;
+  preview.value = null;
+  focusSubtaskId.value = null;
+  selectedSubtaskId.value = null;
+  showIterationList.value = false;
+  await load();
 }
 
-function toggleSummary(id: number) {
-  const next = new Set(openSummaryIds.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  openSummaryIds.value = next;
+function backToIterations() {
+  showIterationList.value = true;
+  iterDetail.value = null;
+  preview.value = null;
+  focusSubtaskId.value = null;
 }
 
+// ---------------- 预览联动 ----------------
+function onPreview(payload: PreviewPayload) {
+  preview.value = payload;
+}
+function closePreview() {
+  preview.value = null;
+}
+/** 左栏可能点击到其它迭代下的子任务：自动切到该迭代再选中。 */
+async function selectSubtask(id: number) {
+  const sub = detail.value?.subtasks.find((s) => s.id === id);
+  if (sub?.iteration_id && sub.iteration_id !== activeIterationId.value) {
+    await openIteration(sub.iteration_id);
+  }
+  selectedSubtaskId.value = id;
+}
+async function viewSubtask(sub: Subtask) {
+  await selectSubtask(sub.id);
+  focusSubtaskId.value = sub.id;
+  showTools.value = false;
+}
+async function openDesign(sub: Subtask) {
+  await selectSubtask(sub.id);
+  preview.value = {
+    kind: "design",
+    title: "模块设计方案",
+    content: sub.design_content || "该模块还没有设计文档。",
+    source: `#${sub.sort_index} ${sub.subtask_name} · 第 ${sub.current_round} 轮`,
+    time: currentIteration.value?.version
+  };
+}
+/** 把某个模块的每一轮归档渲染成可读文本，在右侧预览。 */
+function openHistory(sub: Subtask) {
+  void selectSubtask(sub.id);
+  const typeLabel: Record<string, string> = {
+    code_review: "代码评审",
+    summary_review: "摘要校验",
+    human_reject: "人工驳回",
+    global_rework: "全局返工"
+  };
+  const blocks = sub.iteration_records.map((rec, idx) => {
+    const decision =
+      rec.review_decision === "pass" ? "✅ 通过" : rec.review_decision === "reject" ? "❌ 不通过" : "—";
+    const lines = [
+      `## 第 ${rec.round || idx + 1} 轮 · ${typeLabel[rec.type] ?? rec.type} · ${decision}`,
+      `时间：${rec.created_at || "—"}`
+    ];
+    if (rec.review_feedback) lines.push("", "评审意见：", rec.review_feedback);
+    if (rec.summary_content) lines.push("", "摘要：", rec.summary_content);
+    if (rec.diff) lines.push("", "本轮 diff：", "```diff", rec.diff, "```");
+    return lines.join("\n");
+  });
+  preview.value = {
+    kind: "review",
+    title: "模块轮次历史",
+    content: blocks.length
+      ? blocks.join("\n\n---\n\n")
+      : "该模块还没有归档的轮次记录。",
+    source: `#${sub.sort_index} ${sub.subtask_name} · 共 ${sub.iteration_records.length} 轮`,
+    time: currentIteration.value?.version
+  };
+}
+function clearFocus() {
+  focusSubtaskId.value = null;
+}
+function contractPreview(kind: "tech_stack" | "contract" | "requirement" | "criteria") {
+  const t = task.value;
+  if (!t) return;
+  const map = {
+    tech_stack: {
+      kind: "tech_stack" as const,
+      title: "技术栈",
+      content: t.tech_stack || "拆解完成后生成。"
+    },
+    contract: {
+      kind: "contract" as const,
+      title: "全局契约",
+      content: t.global_contract || "拆解完成后生成。"
+    },
+    requirement: {
+      kind: "requirement" as const,
+      title: "顶层需求",
+      content: t.top_requirement || "（空）"
+    },
+    criteria: {
+      kind: "criteria" as const,
+      title: "项目验收标准",
+      content: t.global_accept_criteria || "（空）"
+    }
+  };
+  preview.value = { ...map[kind], source: currentIteration.value?.version };
+}
+function previewIterationRequirement() {
+  const it = currentIteration.value;
+  preview.value = {
+    kind: "requirement",
+    title: `本次迭代需求（${it?.version || "待定"}）`,
+    content: it?.requirement || "（暂无需求描述）",
+    source: it?.version,
+    time: it?.start_time
+  };
+}
+function previewSelectedDesign() {
+  const sub = selected.value;
+  if (!sub) return showToast("请先在左侧选择一个子任务", "error");
+  openDesign(sub);
+}
+
+// ---------------- 任务操作 ----------------
 async function doResume() {
   if (!task.value) return;
   actionBusy.value = true;
   try {
     await resumeTask(task.value.id);
-    showToast("已请求恢复调度", "success");
+    showToast(
+      task.value.status === "terminated" ? "任务已继续，从当前进度恢复" : "已请求恢复调度",
+      "success"
+    );
     scheduleReload();
   } catch (e) {
     showToast(errorMessage(e), "error");
@@ -288,14 +617,57 @@ async function doResume() {
   }
 }
 
-async function doCancel() {
+function openFollowup() {
   if (!task.value) return;
-  if (!window.confirm("确认终止当前任务？当前 dsh 会被立即停止；已产生的数据和执行记录都会保留，之后可以恢复。"))
+  showFollowup.value = true;
+}
+
+function onFollowupQueued() {
+  showFollowup.value = false;
+  showIterationList.value = true;
+  scheduleReload();
+}
+
+async function doRun() {
+  if (!task.value) return;
+  actionBusy.value = true;
+  try {
+    const outcome = await startTask(task.value.id);
+    showToast(outcome.message, outcome.started ? "success" : "error");
+    scheduleReload();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function doPause() {
+  if (!task.value) return;
+  actionBusy.value = true;
+  try {
+    await pauseTask(task.value.id);
+    showToast("已发送暂停请求", "success");
+    scheduleReload();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function doTerminate() {
+  if (!task.value) return;
+  if (
+    !window.confirm(
+      "确认终止当前任务？终止后不会再派发新的子任务；已产生的代码、日志和模块快照会保留，之后可以点击「继续任务」恢复。"
+    )
+  )
     return;
   actionBusy.value = true;
   try {
-    await cancelTask(task.value.id);
-    showToast("已发送终止请求", "success");
+    await terminateTask(task.value.id);
+    showToast("任务已终止", "success");
     scheduleReload();
   } catch (e) {
     showToast(errorMessage(e), "error");
@@ -304,16 +676,18 @@ async function doCancel() {
   }
 }
 
-async function saveConfig() {
+function onRequirementsSaved(updated: TaskMain) {
+  if (detail.value) detail.value.task = updated;
+  scheduleReload();
+}
+
+async function saveConfig(input: RuntimeConfigInput) {
   if (!task.value) return;
   actionBusy.value = true;
   try {
-    await updateTaskConfig(task.value.id, {
-      module_max_round: Number(configForm.module_max_round),
-      global_max_round: Number(configForm.global_max_round),
-      manual_review_enabled: configForm.manual_review_enabled
-    });
+    await updateTaskConfig(task.value.id, input);
     showToast("运行中配置已保存", "success");
+    showConfig.value = false;
     await load();
   } catch (e) {
     showToast(errorMessage(e), "error");
@@ -371,11 +745,7 @@ async function submitDesignReject() {
   if (!designRejectText.value.trim()) return showToast("请填写设计修改意见", "error");
   actionBusy.value = true;
   try {
-    await rejectDesign(
-      task.value.id,
-      designGateSubtask.value.id,
-      designRejectText.value.trim()
-    );
+    await rejectDesign(task.value.id, designGateSubtask.value.id, designRejectText.value.trim());
     showDesignReject.value = false;
     showToast("已驳回设计，技术总监将重新设计", "success");
     scheduleReload();
@@ -404,12 +774,37 @@ async function sendMessage() {
 }
 
 async function forcePass() {
-  if (!task.value || !selected.value) return;
-  if (!window.confirm(`确认人工强制通过子任务「${selected.value.subtask_name}」？`)) return;
+  if (!task.value || !humanTarget.value) return;
+  const target = humanTarget.value;
+  const action = humanActionLabel.value;
+  if (!window.confirm(`确认对子任务「${target.subtask_name}」执行：${action}？`)) return;
   actionBusy.value = true;
   try {
-    await humanForcePass(task.value.id, selected.value.id);
-    showToast("已人工强制通过，调度继续", "success");
+    await humanForcePass(task.value.id, target.id);
+    showToast("已人工通过，调度继续", "success");
+    scheduleReload();
+  } catch (e) {
+    showToast(errorMessage(e), "error");
+  } finally {
+    actionBusy.value = false;
+  }
+}
+
+async function extendRounds(rounds: number) {
+  if (!task.value || !humanTarget.value) return;
+  const target = humanTarget.value;
+  const extra = Number(rounds);
+  if (!Number.isInteger(extra) || extra < 1) return showToast("请选择追加轮次", "error");
+  if (
+    !window.confirm(
+      `确认给子任务「${target.subtask_name}」追加 ${extra} 轮？将从当前失败阶段继续自动执行。`
+    )
+  )
+    return;
+  actionBusy.value = true;
+  try {
+    await extendSubtaskRounds(task.value.id, target.id, extra);
+    showToast(`已追加 ${extra} 轮，任务继续自动执行`, "success");
     scheduleReload();
   } catch (e) {
     showToast(errorMessage(e), "error");
@@ -419,6 +814,7 @@ async function forcePass() {
 }
 
 function openRejectModal() {
+  if (!humanTarget.value) return;
   rejectText.value = "";
   showReject.value = true;
 }
@@ -432,11 +828,11 @@ function openDesignReject() {
 }
 
 async function submitReject() {
-  if (!task.value || !selected.value) return;
+  if (!task.value || !humanTarget.value) return;
   if (!rejectText.value.trim()) return showToast("请填写人工修改意见", "error");
   actionBusy.value = true;
   try {
-    await humanReject(task.value.id, selected.value.id, rejectText.value.trim());
+    await humanReject(task.value.id, humanTarget.value.id, rejectText.value.trim());
     showReject.value = false;
     showToast("已人工驳回并继续派发 Coder", "success");
     scheduleReload();
@@ -486,27 +882,95 @@ async function submitGlobalRework() {
   }
 }
 
+async function openConsole() {
+  if (!task.value) return;
+  try {
+    allEvents.value = await listTaskEvents(task.value.id);
+  } catch (e) {
+    allEvents.value = executionEvents.value;
+    showToast(errorMessage(e), "error");
+  }
+  showConsole.value = true;
+}
+
+function eventKindLabel(kind: string) {
+  if (kind === "llm_response:requirement_intake") return "追加需求梳理结果";
+  const map: Record<string, string> = {
+    llm_request: "LLM 请求",
+    llm_response: "LLM 响应",
+    llm_error: "LLM 错误",
+    dsh_stdout: "dsh 输出",
+    dsh_stderr: "dsh stderr",
+    coder_prompt: "Coder Prompt",
+    summary_prompt: "摘要 Prompt",
+    git_diff: "Git Diff",
+    module_design: "模块设计",
+    summary_file: "摘要文件",
+    human_message: "人工消息",
+    human_message_delivered: "人工消息已注入",
+    plan_approval: "方案待审批",
+    plan_approved: "方案通过",
+    plan_rejected: "方案驳回",
+    requirement_queued: "追加需求已提交",
+    requirement_accepted: "追加需求已梳理",
+    requirement_intake: "追加需求梳理",
+    design_approved: "设计通过",
+    design_rejected: "设计驳回",
+    config_updated: "配置更新",
+    plan_accepted: "方案确认",
+    agent_message: "Agent 对话",
+    tool_call: "工具调用",
+    tool_result: "工具结果",
+    dsh_error: "Coder 错误",
+    dsh_raw: "dsh 原始输出",
+    system_log: "系统日志",
+    requirements_updated: "需求更新",
+    human_extend_rounds: "人工追加轮次"
+  };
+  const base = kind.includes(":") ? kind.slice(0, kind.indexOf(":")) : kind;
+  return map[base] ?? kind;
+}
+function eventKindClass(kind: string) {
+  if (kind.startsWith("llm_error") || kind === "design_rejected" || kind === "plan_rejected")
+    return "ev-error";
+  if (kind.startsWith("llm_response") || kind === "plan_approved" || kind === "design_approved")
+    return "ev-ok";
+  if (
+    kind === "human_message" ||
+    kind === "human_message_delivered" ||
+    kind === "requirement_queued"
+  )
+    return "ev-human";
+  if (kind.startsWith("llm_request")) return "ev-request";
+  return "";
+}
+
 function applyLiveEvent(event: TaskEvent) {
   if (!detail.value || event.task_id !== detail.value.task.id) return;
-  const exists = detail.value.execution_events.some((e) => e.id === event.id);
-  if (!exists) detail.value.execution_events.push(event);
-  if (detail.value.execution_events.length > 4000) {
-    detail.value.execution_events = detail.value.execution_events.slice(-3000);
+  if (!iterDetail.value || event.iteration_id !== activeIterationId.value) return;
+  const exists = iterDetail.value.execution_events.some((e) => e.id === event.id);
+  if (!exists) iterDetail.value.execution_events.push(event);
+  if (iterDetail.value.execution_events.length > 5000) {
+    iterDetail.value.execution_events = iterDetail.value.execution_events.slice(-4000);
   }
-  void nextTick().then(scrollEvents);
 }
 
 watch(
   () => props.taskId,
   () => {
-    selectedSubtaskId.value = null;
     detail.value = null;
+    iterDetail.value = null;
+    activeIterationId.value = null;
+    selectedSubtaskId.value = null;
+    preview.value = null;
+    focusSubtaskId.value = null;
+    showIterationList.value = true;
     void load();
   }
 );
 
 watch(
-  () => detail.value?.logs.length,
+  () => logs.value.length,
   async () => {
     await nextTick();
     scrollLogs();
@@ -514,6 +978,12 @@ watch(
 );
 
 onMounted(async () => {
+  loadWidths();
+  if (columnsRef.value) {
+    columnsObserver = new ResizeObserver(() => clampWidths());
+    columnsObserver.observe(columnsRef.value);
+    clampWidths();
+  }
   await load();
   unlisten = await listen<{ task_id: number }>("task-updated", (ev) => {
     if (ev.payload?.task_id === props.taskId) scheduleReload();
@@ -527,6 +997,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  stopResize?.();
+  columnsObserver?.disconnect();
   unlisten?.();
   eventUnlisten?.();
   if (pollTimer) window.clearInterval(pollTimer);
@@ -545,35 +1017,97 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <!-- 第一屏：迭代（版本）列表，按版本倒序 -->
+    <IterationList
+      v-else-if="task && showIterationList"
+      :task="task"
+      :iterations="iterations"
+      :loading="loading"
+      :busy="actionBusy"
+      @open="openIteration"
+      @back="emit('back')"
+      @followup="openFollowup"
+      @refresh="load"
+    />
+
     <template v-else-if="task">
       <div class="workbench-top">
-        <button class="back" title="返回任务列表" @click="emit('back')">←</button>
+        <button class="back" title="返回迭代列表" @click="backToIterations">←</button>
         <div>
-          <div class="task-title">{{ task.task_name }}</div>
+          <div class="task-title">
+            <span class="iteration-badge">{{ currentIteration?.version || "dev-?.? 待定" }}</span>
+            {{ task.task_name }}
+          </div>
           <div class="meta">
-            <span>评审：{{ detail?.reviewer?.name ?? "—" }}</span>
-            <span>Coder：{{ detail?.coders.map((c) => c.name).join("、") || "—" }}</span>
-            <span>阶段：{{ task.task_phase === "global_review" ? "全局评审" : task.task_phase === "plan_approval" ? "方案审批" : "模块开发" }}</span>
+            <span v-if="detail?.workflow?.length" class="meta-workflow">
+              工作流：
+              <template v-for="(step, index) in detail.workflow" :key="step.agent_id">
+                <span class="wf-meta-role" :style="{ color: step.role_color || undefined }">
+                  {{ step.role_name }}
+                </span>
+                <span class="wf-meta-agent">{{ step.agent_name }}</span>
+                <span v-if="index < detail.workflow.length - 1" class="wf-meta-arrow">→</span>
+              </template>
+            </span>
+            <span>阶段：{{ phaseLabel }}</span>
             <span>状态：{{ statusText }}</span>
+            <span>执行：{{ executionModeLabel }}</span>
+            <span v-if="scheduleText">窗口：{{ scheduleText }}</span>
             <span>人工审核：{{ task.manual_review_enabled ? "开启" : "关闭" }}</span>
-            <span>模块轮次：{{ task.module_max_round }}</span>
-            <span>全局轮次：{{ task.current_global_round }}/{{ task.global_max_round }}</span>
+            <span>轮次：{{ task.current_global_round }}/{{ task.global_max_round }}</span>
+            <span>Token：{{ currentIterationTokens }}</span>
           </div>
         </div>
         <div class="flex" style="margin-left: auto">
-          <button class="btn btn-sm" @click="showConfig = !showConfig">
-            ⚙ 运行中配置
+          <button class="btn btn-sm" @click="showConfig = true">⚙ 配置</button>
+          <button
+            v-if="task.status !== 'completed' && task.status !== 'terminated'"
+            class="btn btn-sm"
+            :disabled="actionBusy"
+            @click="showRequirements = true"
+          >
+            📝 需求
           </button>
           <button
-            v-if="canCancel"
+            v-if="isCompleted"
+            class="btn btn-sm btn-primary"
+            :disabled="actionBusy"
+            @click="openFollowup"
+          >
+            ＋ 追加需求
+          </button>
+          <button class="btn btn-sm" :disabled="actionBusy" @click="showChat = true">
+            💬 问答
+          </button>
+          <button v-if="canRun" class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doRun">
+            运行
+          </button>
+          <button v-if="canPause" class="btn btn-sm" :disabled="actionBusy" @click="doPause">
+            暂停
+          </button>
+          <button
+            v-if="canResume && !humanTarget"
+            class="btn btn-sm"
+            :disabled="actionBusy"
+            @click="doResume"
+          >
+            恢复
+          </button>
+          <button
+            v-if="canContinue"
+            class="btn btn-sm btn-primary"
+            :disabled="actionBusy"
+            @click="doResume"
+          >
+            继续任务
+          </button>
+          <button
+            v-if="canTerminate"
             class="btn btn-sm btn-danger"
             :disabled="actionBusy"
-            @click="doCancel"
+            @click="doTerminate"
           >
-            终止执行
-          </button>
-          <button v-if="canResume" class="btn btn-sm" :disabled="actionBusy" @click="doResume">
-            恢复调度
+            终止
           </button>
         </div>
         <div class="phase-banner" :class="phaseBanner.cls" style="margin-left: 10px">
@@ -581,153 +1115,96 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div v-if="showConfig" class="runtime-config">
-        <div class="rc-title">运行中配置 <span>修改后立即生效，不需要停止任务</span></div>
-        <div class="rc-grid">
-          <div class="field">
-            <label>单个子任务最大轮次</label>
-            <input v-model.number="configForm.module_max_round" type="number" min="1" max="99" />
-          </div>
-          <div class="field">
-            <label>全局评审最大轮次</label>
-            <input v-model.number="configForm.global_max_round" type="number" min="1" max="99" />
-          </div>
-          <div class="field" style="justify-content: flex-end">
-            <label class="flex" style="cursor: pointer">
-              <input v-model="configForm.manual_review_enabled" type="checkbox" />
-              人工审核方案与模块设计
-            </label>
-          </div>
-          <div class="field" style="justify-content: flex-end">
-            <button class="btn btn-primary" :disabled="actionBusy" @click="saveConfig">
-              保存配置
-            </button>
-          </div>
-        </div>
-      </div>
+      <div ref="columnsRef" class="wb-columns" :style="columnsStyle">
+        <IterationTree
+          :task="task"
+          :iterations="iterations"
+          :subtasks="detail?.subtasks ?? []"
+          :active-iteration-id="activeIterationId"
+          :selected-subtask-id="selectedSubtaskId"
+          :frozen="isGlobal && !isCompleted"
+          @open-iteration="openIteration"
+          @select-subtask="selectSubtask"
+          @view="viewSubtask"
+          @design="openDesign"
+          @history="openHistory"
+        />
 
-      <div class="wb-columns">
-        <aside class="wb-col left">
-          <div class="wb-section-title">
-            <template v-if="isPlanApproval">待审批模块方案</template>
-            <template v-else>子任务（模块）队列</template>
-            <span v-if="!isPlanApproval" class="count">
-              {{ completedSubtasks.length }}/{{ subtasks.length }} 已完成
-            </span>
-            <span v-else class="count">{{ pendingPlan?.subtasks.length ?? 0 }} 个模块</span>
-          </div>
+        <div
+          class="wb-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整左栏宽度，双击恢复默认"
+          title="拖动调整左栏宽度，双击恢复默认"
+          @pointerdown.prevent="startResize('left', $event)"
+          @dblclick="resetWidths"
+        ></div>
 
-          <template v-if="isPlanApproval">
-            <div class="plan-wait-tip">
-              技术总监已完成拆解，同意方案后才会创建子任务并交给 Coder。
-            </div>
-            <article
-              v-for="(item, idx) in pendingPlan?.subtasks ?? []"
-              :key="idx"
-              class="subtask-card plan-item"
-            >
-              <div class="subtask-main">
-                <div class="subtask-head">
-                  <div class="subtask-index">{{ idx + 1 }}</div>
-                  <div class="subtask-name">{{ item.name }}</div>
-                </div>
-                <div class="subtask-meta-row">
-                  <span class="badge badge-yellow">待人工审批</span>
-                </div>
-              </div>
-            </article>
-          </template>
-
-          <template v-else>
-            <div v-if="task.status === 'planning'" class="empty-state" style="padding: 30px 10px">
-              <div class="big">🧠</div>
-              <div class="title">技术总监正在拆解需求</div>
-              <div class="small">可随时点击“终止执行”或输入人工消息介入。</div>
+        <section class="wb-col wb-col-mid">
+          <!-- 固定区：追加需求 / 人工介入入口与「方案与契约」，不跟随对话滚动，也不覆盖内容 -->
+          <div class="wb-mid-head">
+            <div v-if="!isLatestIteration" class="history-banner">
+              正在查看历史迭代 <b>{{ currentIteration?.version }}</b>
+              （当前最新版本 {{ iterations[iterations.length - 1]?.version || "待定" }}）。
+              <button class="link-btn" @click="backToIterations">返回迭代列表</button>
             </div>
 
-            <div v-else-if="!subtasks.length" class="empty-state" style="padding: 30px 10px">
-              <div class="small">暂无子任务</div>
-            </div>
-
-            <SubtaskCard
-              v-for="sub in subtasks"
-              :key="sub.id"
-              :subtask="sub"
-              :selected="sub.id === selectedSubtaskId"
-              :frozen="isGlobal"
-              @select="selectedSubtaskId = sub.id"
+            <ActionDock
+              :task="task"
+              :subtasks="subtasks"
+              :human-target="humanTarget"
+              :design-gate-subtask="designGateSubtask"
+              :pending-human-subtask="pendingHumanSubtask"
+              :pending-plan="pendingPlan"
+              :can-human="canHuman"
+              :busy="actionBusy"
+              :human-stage-label="humanStageLabel"
+              :human-action-label="humanActionLabel"
+              :human-reason="humanReason"
+              @run="doRun"
+              @resume="doResume"
+              @followup="openFollowup"
+              @approve-plan="doApprovePlan"
+              @reject-plan="openPlanReject"
+              @approve-design="doApproveDesign"
+              @reject-design="openDesignReject"
+              @force-pass="forcePass"
+              @reject="openRejectModal"
+              @extend="extendRounds"
+              @global-force-pass="doGlobalForcePass"
+              @global-rework="openGlobalRework"
             />
 
-            <div v-if="isGlobal" class="panel" style="padding: 11px">
-              <div class="flex">
-                <span class="badge badge-yellow">全局评审收口</span>
-                <span class="small muted">队列已冻结</span>
-              </div>
-              <div class="small muted" style="margin-top: 6px">
-                全部模块已完成，正在进行跨模块一致性/安全/命名规范收口。
-              </div>
+            <!-- 方案与契约：主要内容入口固定在中栏顶部，点击后在右栏预览 -->
+            <div class="contract-bar">
+              <span class="contract-bar-title">方案与契约</span>
+              <button class="chip" @click="previewIterationRequirement">本次迭代需求</button>
+              <button class="chip" @click="contractPreview('requirement')">顶层需求</button>
+              <button class="chip" @click="contractPreview('criteria')">验收标准</button>
+              <button class="chip" @click="contractPreview('tech_stack')">技术栈</button>
+              <button class="chip" @click="contractPreview('contract')">全局契约</button>
+              <button class="chip" @click="previewSelectedDesign">
+                当前模块设计{{ selected?.design_content ? "" : "（暂无）" }}
+              </button>
+              <button class="chip" style="margin-left: auto" @click="openConsole">原始事件</button>
             </div>
-          </template>
-        </aside>
-
-        <section class="wb-col">
-          <!-- 操作台固定在中栏顶部，避免长内容把审批/兜底按钮顶出视野 -->
-          <div class="action-dock">
-            <template v-if="isPlanApproval">
-              <div class="human-bar">
-                <div class="tip">只有你同意方案后，Coder 才会开始工作。</div>
-                <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doApprovePlan">
-                  同意方案，开始开发
-                </button>
-                <button class="btn btn-sm btn-danger" :disabled="actionBusy" @click="openPlanReject">
-                  驳回，让技术总监修改
-                </button>
-              </div>
-            </template>
-            <template v-else-if="isDesignAwaiting">
-              <div class="human-bar">
-                <div class="tip">设计文档审批通过后，该模块才会派发给 Coder。</div>
-                <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doApproveDesign">
-                  同意设计，派发 Coder
-                </button>
-                <button class="btn btn-sm btn-danger" :disabled="actionBusy" @click="openDesignReject">
-                  驳回设计
-                </button>
-              </div>
-            </template>
-            <template v-else-if="isGlobal">
-              <div v-if="task.status === 'needs_human'" class="human-bar">
-                <div class="tip">全局评审轮次已耗尽：可强制通过收口，或指定模块返工。</div>
-                <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="doGlobalForcePass">
-                  人工强制通过全局评审
-                </button>
-                <button class="btn btn-sm btn-danger" :disabled="actionBusy" @click="openGlobalRework">
-                  人工指定模块返工
-                </button>
-              </div>
-            </template>
-            <template v-else-if="!isPlanApproval">
-              <div class="human-bar">
-                <div class="tip">
-                  人工兜底：仅在调度未运行时可用；终止后数据保留，可恢复。
-                </div>
-                <button
-                  class="btn btn-sm btn-primary"
-                  :disabled="!canHuman || actionBusy"
-                  @click="forcePass"
-                >
-                  人工强制标记通过
-                </button>
-                <button
-                  class="btn btn-sm btn-danger"
-                  :disabled="!canHuman || actionBusy"
-                  @click="openRejectModal"
-                >
-                  人工驳回
-                </button>
-              </div>
-            </template>
           </div>
+
+          <!-- 滚动区：只有对话时间线 / 全局评审 / 系统日志在这里滚动 -->
+          <div class="wb-mid-scroll">
+
+          <TimelinePanel
+            v-model:show-tools="showTools"
+            :auto-scroll="!isPlanApproval"
+            :events="executionEvents"
+            :subtasks="subtasks"
+            :iteration="currentIteration"
+            :reviewer-name="detail?.reviewer?.name ?? '技术总监'"
+            :coder-name="detail?.coders[0]?.name ?? 'Coder'"
+            :focus-subtask-id="focusSubtaskId"
+            @preview="onPreview"
+            @clear-focus="clearFocus"
+          />
 
           <div v-if="isPlanApproval" class="global-view">
             <div class="current-head">
@@ -744,14 +1221,29 @@ onUnmounted(() => {
             <div class="round-block">
               <div class="head">技术栈</div>
               <div class="body">
-                <pre class="pre-box" style="max-height: 160px">{{ pendingPlan?.tech_stack || task.tech_stack || "（未提供）" }}</pre>
+                <div class="md-scroll">
+                  <MarkdownView
+                    :content="stripDuplicateHeading(pendingPlan?.tech_stack || task.tech_stack || '', '技术栈')"
+                    placeholder="（未提供）"
+                  />
+                </div>
               </div>
             </div>
 
             <div class="round-block">
               <div class="head">全局契约</div>
               <div class="body">
-                <pre class="pre-box" style="max-height: 260px">{{ pendingPlan?.global_contract || task.global_contract || "（未提供）" }}</pre>
+                <div class="md-scroll">
+                  <MarkdownView
+                    :content="
+                      stripDuplicateHeading(
+                        pendingPlan?.global_contract || task.global_contract || '',
+                        '全局契约'
+                      )
+                    "
+                    placeholder="（未提供）"
+                  />
+                </div>
               </div>
             </div>
 
@@ -768,20 +1260,28 @@ onUnmounted(() => {
                 </div>
               </div>
             </div>
-
           </div>
 
           <div v-else-if="isGlobal" class="global-view">
             <div class="current-head">
               <div>
-                <div class="t">全局评审收口阶段</div>
+                <div class="t">
+                  {{ isCompleted ? "全局评审收口完成" : "全局评审收口阶段" }}
+                </div>
                 <div class="s">
-                  第 {{ task.current_global_round }} / {{ task.global_max_round }} 轮 ·
+                  迭代 {{ currentIteration?.version }} · 第
+                  {{ task.current_global_round }} / {{ task.global_max_round }} 轮 ·
                   上下文 = 全局契约 + 所有模块摘要 + 全部模块 diff 汇总
                 </div>
               </div>
-              <span class="badge badge-yellow right">
-                {{ task.status === "needs_human" ? "等待人工介入" : "评审中" }}
+              <span class="badge right" :class="isCompleted ? 'badge-green' : 'badge-yellow'">
+                {{
+                  isCompleted
+                    ? "✅ 已完成"
+                    : task.status === "needs_human"
+                      ? "等待人工介入"
+                      : "评审中"
+                }}
               </span>
             </div>
 
@@ -789,19 +1289,17 @@ onUnmounted(() => {
               <div class="body muted">正在汇总全部模块的 summary 与 diff，提交全局评审…</div>
             </div>
 
-            <div
-              v-for="rec in task.global_review_records"
-              :key="rec.round"
-              class="global-round-card"
-            >
+            <div v-for="rec in task.global_review_records" :key="rec.round" class="global-round-card">
               <div class="gh">
-                <span class="badge badge-blue">全局第 {{ rec.round }} 轮</span>
+                <span class="badge badge-blue">
+                  第 {{ rec.cycle || 1 }} 次迭代 · 全局第 {{ rec.round }} 轮
+                </span>
                 <span class="decision" :class="rec.passed ? 'pass' : 'reject'">
                   {{ rec.passed ? "✅ 通过" : "❌ 不通过" }}
                 </span>
                 <span class="small muted right">{{ rec.created_at }}</span>
               </div>
-              <div style="white-space: pre-wrap; color: #c2cbdb; font-size: 12.5px">
+              <div style="white-space: pre-wrap; color: var(--text-2); font-size: 12.5px">
                 {{ rec.feedback || "（无补充说明）" }}
               </div>
               <div v-for="(issue, i) in rec.issues" :key="i" class="issue-item">
@@ -811,237 +1309,76 @@ onUnmounted(() => {
                 </div>
               </div>
             </div>
-
           </div>
 
-          <div v-else class="current-panel">
-            <div v-if="!selected" class="empty-state">
-              <div class="big">⏳</div>
-              <div class="title">等待子任务派发</div>
+          <details class="system-logs">
+            <summary>系统事件日志（{{ logs.length }}）</summary>
+            <div ref="logBox" class="log-box">
+              <div v-if="!logs.length" class="muted">
+                该迭代没有持久化日志（可能创建时未开启日志持久化）。
+              </div>
+              <div v-for="log in logs" :key="log.id" class="log-line" :class="log.level">
+                <span class="log-time">{{ log.create_time.slice(11) }}</span>
+                <span class="log-msg">{{ log.message }}</span>
+              </div>
             </div>
+          </details>
+          </div>
+          <!-- /滚动区 -->
 
-            <template v-else>
-              <div class="current-head">
-                <div>
-                  <div class="t">
-                    <span class="muted">#{{ selected.sort_index }}</span>
-                    {{ selected.subtask_name }}
-                  </div>
-                  <div class="s">
-                    {{ stageLabel }} · 当前轮次 {{ selected.current_round }}/{{ selected.max_round }}
-                  </div>
-                </div>
-                <span
-                  class="badge right"
-                  :class="{
-                    'badge-yellow': selected.status === 'in_progress',
-                    'badge-green': selected.status === 'completed',
-                    'badge-red': selected.status === 'needs_human'
-                  }"
-                >
-                  {{ subtaskStatusLabel }}
+          <!-- 固定区：人工实时介入输入框固定在底部，不遮挡对话内容 -->
+          <div
+            v-if="
+              isLatestIteration &&
+              task.status !== 'completed' &&
+              task.status !== 'terminated'
+            "
+            class="wb-mid-foot"
+          >
+            <div class="human-composer">
+              <div class="hc-title">
+                人工实时介入
+                <span class="small muted">消息会在下一个 Agent 步骤注入；不会清空任何数据</span>
+              </div>
+              <div class="hc-row">
+                <textarea
+                  v-model="humanMessage"
+                  rows="2"
+                  placeholder="随时输入消息，例如：先完成登录再做列表；接口统一使用 snake_case；停止当前方案…"
+                  @keydown.ctrl.enter.prevent="sendMessage"
+                ></textarea>
+                <button class="btn btn-primary" :disabled="actionBusy" @click="sendMessage">
+                  发送介入
+                </button>
+              </div>
+              <div v-if="pendingMessages.length" class="pending-msgs">
+                <span class="small muted">待注入：</span>
+                <span v-for="m in pendingMessages" :key="m.id" class="pending-msg">
+                  {{ m.content }}
                 </span>
               </div>
-
-              <div v-if="selected.design_content" class="round-block">
-                <div class="head">
-                  模块详细设计（技术总监）
-                  <span v-if="isDesignAwaiting" class="badge badge-yellow right">等待人工审批</span>
-                </div>
-                <div class="body">
-                  <pre class="pre-box" style="max-height: 360px">{{ selected.design_content }}</pre>
-                </div>
-              </div>
-              <div v-else-if="selected.current_stage === 'design_generation'" class="round-block">
-                <div class="body muted">技术总监正在生成当前模块的详细设计文档…</div>
-              </div>
-
-
-              <div class="round-block">
-                <div class="head">
-                  本子任务验收标准
-                  <span class="right small muted">评审拆分原文</span>
-                </div>
-                <div class="body" style="white-space: pre-wrap; color: #c2cbdb; font-size: 12.5px">
-                  {{ selected.accept_criteria || "（评审未提供）" }}
-                </div>
-              </div>
-
-              <div v-if="!latestRecord && !isDesignStage" class="round-block">
-                <div class="body muted">
-                  <template v-if="selected.status === 'waiting'">
-                    子任务在队列中，等待前序模块完成。
-                  </template>
-                  <template v-else-if="selected.current_stage === 'coding'">
-                    Coder 正在通过 dsh 编写代码，本轮 diff 完成后展示。
-                  </template>
-                  <template v-else-if="selected.current_stage === 'summary_generation'">
-                    Coder 正在生成 summary.md 模块摘要。
-                  </template>
-                  <template v-else>等待调度事件…</template>
-                </div>
-              </div>
-
-              <template v-if="latestRecord && !isDesignStage">
-                <div class="round-block">
-                  <div class="head">
-                    Coder 提交 diff
-                    <span class="badge badge-blue" style="margin-left: 6px">
-                      第 {{ latestRecord.round }} 轮
-                    </span>
-                    <span class="right small muted">{{ latestRecord.created_at }}</span>
-                  </div>
-                  <div class="body">
-                    <pre v-if="latestRecord.diff" class="pre-box diff-pre">{{ latestRecord.diff }}</pre>
-                    <div v-else class="muted small">本轮没有代码变更（或 diff 为空）。</div>
-                  </div>
-                </div>
-
-                <div v-if="latestRecord.summary_content" class="round-block">
-                  <div class="head">Coder 提交的 summary.md</div>
-                  <div class="body">
-                    <pre class="pre-box">{{ latestRecord.summary_content }}</pre>
-                  </div>
-                </div>
-
-                <div class="round-block">
-                  <div class="head">
-                    Reviewer 评审意见
-                    <span class="decision right" :class="latestRecord.review_decision">
-                      {{ decisionText(latestRecord.review_decision) }}
-                    </span>
-                  </div>
-                  <div class="body" style="white-space: pre-wrap; color: #c2cbdb">
-                    {{ feedbackText(latestRecord) }}
-                  </div>
-                </div>
-              </template>
-
-
-            </template>
-          </div>
-
-          <div v-if="task.status !== 'completed'" class="human-composer">
-            <div class="hc-title">
-              人工实时介入
-              <span class="small muted">消息会在下一个 Agent 步骤注入；不会清空任何数据</span>
-            </div>
-            <div class="hc-row">
-              <textarea
-                v-model="humanMessage"
-                rows="2"
-                placeholder="随时输入消息，例如：先完成登录再做列表；接口统一使用 snake_case；停止当前方案…"
-                @keydown.ctrl.enter.prevent="sendMessage"
-              ></textarea>
-              <button class="btn btn-primary" :disabled="actionBusy" @click="sendMessage">
-                发送介入
-              </button>
-            </div>
-            <div v-if="pendingMessages.length" class="pending-msgs">
-              <span class="small muted">待注入：</span>
-              <span v-for="m in pendingMessages" :key="m.id" class="pending-msg">
-                {{ m.content }}
-              </span>
             </div>
           </div>
         </section>
 
-        <aside class="wb-col right">
-          <div class="wb-section-title">技术栈</div>
-          <div class="contract-box">
-            <div class="ch" @click="techStackOpen = !techStackOpen">
-              <span>{{ techStackOpen ? "▾" : "▸" }}</span>
-              <span>技术总监选型</span>
-            </div>
-            <div v-if="techStackOpen" class="cb">
-              <pre v-if="task.tech_stack" class="pre-box" style="max-height: 180px">{{ task.tech_stack }}</pre>
-              <div v-else class="small muted">拆解完成后生成。</div>
-            </div>
-          </div>
+        <div
+          class="wb-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整右栏宽度，双击恢复默认"
+          title="拖动调整右栏宽度，双击恢复默认"
+          @pointerdown.prevent="startResize('right', $event)"
+          @dblclick="resetWidths"
+        ></div>
 
-          <div class="wb-section-title">全局契约</div>
-          <div class="contract-box">
-            <div class="ch" @click="contractOpen = !contractOpen">
-              <span>{{ contractOpen ? "▾" : "▸" }}</span>
-              <span>项目统一规范（全程复用）</span>
-            </div>
-            <div v-if="contractOpen" class="cb">
-              <pre v-if="task.global_contract" class="pre-box" style="max-height: 220px">{{
-                task.global_contract
-              }}</pre>
-              <div v-else class="small muted">拆解完成后生成。</div>
-            </div>
-          </div>
-
-          <div class="wb-section-title">
-            已完成模块摘要
-            <span class="count">{{ completedSubtasks.length }} 个</span>
-          </div>
-          <div v-if="!completedSubtasks.length" class="small muted">
-            还没有完成的模块摘要。摘要只作为后续评审上下文，不会携带历史完整对话。
-          </div>
-          <div v-for="sub in completedSubtasks" :key="sub.id" class="summary-item">
-            <div class="sh" @click="toggleSummary(sub.id)">
-              <span>{{ openSummaryIds.has(sub.id) ? "▾" : "▸" }}</span>
-              <span>#{{ sub.sort_index }} {{ sub.subtask_name }}</span>
-              <span class="badge badge-green right">✅</span>
-            </div>
-            <div v-if="openSummaryIds.has(sub.id)" class="sb">
-              <pre v-if="sub.summary_content" class="pre-box" style="max-height: 260px">{{
-                sub.summary_content
-              }}</pre>
-              <div v-else class="small muted">摘要内容为空。</div>
-            </div>
-          </div>
-
-          <div class="wb-section-title">
-            实时执行输出
-            <button class="btn btn-sm btn-ghost" style="margin-left: auto" @click="showConsole = true">
-              展开全部
-            </button>
-          </div>
-          <div ref="eventBox" class="event-box">
-            <div v-if="!visibleEvents.length" class="muted small">暂无执行输出</div>
-            <div
-              v-for="ev in visibleEvents"
-              :key="ev.id"
-              class="event-line"
-              :class="eventKindClass(ev.kind)"
-            >
-              <div class="ev-head">
-                <span class="ev-kind">{{ eventKindLabel(ev.kind) }}</span>
-                <span class="ev-time">{{ ev.create_time.slice(11) }}</span>
-                <span v-if="ev.subtask_id" class="ev-sub">#{{ ev.subtask_id }}</span>
-              </div>
-              <pre class="ev-content">{{ ev.content }}</pre>
-            </div>
-          </div>
-
-          <div class="wb-section-title">系统事件日志</div>
-          <div ref="logBox" class="log-box">
-            <div v-if="!detail?.logs.length" class="muted">暂无事件</div>
-            <div
-              v-for="log in detail?.logs ?? []"
-              :key="log.id"
-              class="log-line"
-              :class="log.level"
-            >
-              <span class="log-time">{{ log.create_time.slice(11) }}</span>
-              <span class="log-msg">{{ log.message }}</span>
-            </div>
-          </div>
-
-          <div class="wb-section-title">任务信息</div>
-          <div class="panel" style="padding: 11px">
-            <div class="meta-list">
-              <div class="kv"><span>任务 ID</span><span>{{ task.id }}</span></div>
-              <div class="kv"><span>工作目录</span><span style="word-break: break-all">{{ task.work_dir }}</span></div>
-              <div class="kv"><span>创建时间</span><span>{{ task.create_time }}</span></div>
-              <div class="kv"><span>人工审核</span><span>{{ task.manual_review_enabled ? "开启" : "关闭" }}</span></div>
-              <div class="kv"><span>子任务数</span><span>{{ subtasks.length }}</span></div>
-            </div>
-          </div>
-        </aside>
+        <PreviewPanel
+          :preview="preview"
+          :task="task"
+          :iteration="currentIteration"
+          :selected-subtask="selected"
+          @preview="onPreview"
+          @close="closePreview"
+        />
       </div>
     </template>
 
@@ -1053,7 +1390,7 @@ onUnmounted(() => {
     <div v-if="showReject" class="modal-mask" @click.self="showReject = false">
       <div class="modal narrow">
         <div class="modal-head">
-          人工驳回 · 输入修改意见
+          人工驳回 · {{ humanTarget?.subtask_name ?? "当前模块" }}
           <button class="x" @click="showReject = false">×</button>
         </div>
         <div class="modal-body">
@@ -1137,17 +1474,52 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <RuntimeConfigModal
+      v-if="showConfig && task"
+      :task="task"
+      :busy="actionBusy"
+      @close="showConfig = false"
+      @save="saveConfig"
+    />
+
+    <ChatPanel
+      v-if="showChat && task"
+      :task-id="task.id"
+      :task-name="task.task_name"
+      :reviewer-name="detail?.reviewer?.name ?? '技术总监'"
+      @close="showChat = false"
+    />
+
+    <RequirementsModal
+      v-if="showRequirements && task"
+      :task="task"
+      @close="showRequirements = false"
+      @saved="onRequirementsSaved"
+    />
+
+    <FollowUpModal
+      v-if="showFollowup && task"
+      :task="task"
+      :subtask-count="detail?.subtasks.length ?? 0"
+      @close="showFollowup = false"
+      @queued="onFollowupQueued"
+    />
+
     <div v-if="showConsole" class="modal-mask" @click.self="showConsole = false">
       <div class="modal console-modal">
         <div class="modal-head">
-          全量执行输出
-          <span class="small muted" style="margin-left: 10px">{{ executionEvents.length }} 条</span>
+          原始事件 · 全链路
+          <span class="small muted" style="margin-left: 10px">
+            {{ (allEvents.length ? allEvents : executionEvents).length }} 条
+          </span>
           <button class="x" @click="showConsole = false">×</button>
         </div>
         <div class="console-modal-body">
-          <div v-if="!executionEvents.length" class="muted">暂无执行输出</div>
+          <div v-if="!(allEvents.length ? allEvents : executionEvents).length" class="muted">
+            暂无执行输出
+          </div>
           <div
-            v-for="ev in executionEvents"
+            v-for="ev in allEvents.length ? allEvents : executionEvents"
             :key="'all-' + ev.id"
             class="event-line"
             :class="eventKindClass(ev.kind)"
