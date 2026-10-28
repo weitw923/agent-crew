@@ -11,4 +11,4 @@ src-tauri/gen
 *.sqlite3
 .idea
 .vscode
-*.zip
+/*.zip
