@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_crew_lib::db;
-use agent_crew_lib::models::{AgentInput, AppSettings, NewTaskInput};
+use agent_crew_lib::models::{AgentInput, AppSettings, NewTaskInput, RoleInput};
 use agent_crew_lib::orchestrator;
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -90,7 +90,8 @@ fn start_mock_llm() -> u16 {
                     "index": 0,
                     "message": { "role": "assistant", "content": content },
                     "finish_reason": "stop"
-                }]
+                }],
+                "usage": { "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150 }
             })
             .to_string();
             let resp = format!(
@@ -109,6 +110,21 @@ fn build_mock_response(
     code_reviews: &Arc<AtomicUsize>,
     global_reviews: &Arc<AtomicUsize>,
 ) -> String {
+    // 临时问答：普通文本响应，不触发流水线。
+    if body.contains("临时问答会话") || body.contains("用户最新问题") {
+        return "临时问答回复：建议继续保持 JWT + 统一返回体，不要启动新的开发任务。".to_string();
+    }
+    // 已完成任务追加需求：增量梳理。
+    if body.contains("增量需求评审者") {
+        return serde_json::json!({
+            "decision": "simple",
+            "analysis": "本次只是增加一个导出入口，可在现有页面内完成，不需要拆分多个模块。",
+            "subtasks": [
+                { "name": "计划导出模块", "accept_criteria": "在现有日历页提供导出入口，按当前计划内容生成 Markdown 文件，并复用统一返回体。" }
+            ]
+        })
+        .to_string();
+    }
     // Planner：system prompt 中的关键词。
     if body.contains("软件架构评审者") || body.contains("请输出拆解 JSON") {
         return serde_json::json!({
@@ -281,10 +297,15 @@ fn full_serial_orchestration_flow() {
             global_accept_criteria: "接口统一、可运行、摘要齐全".into(),
             reviewer_agent_id: reviewer.id,
             coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 3,
             work_dir: work_dir.to_string_lossy().to_string(),
             manual_review_enabled: false,
+            execution_mode: "immediate".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
         },
     )
     .unwrap();
@@ -305,6 +326,28 @@ fn full_serial_orchestration_flow() {
     assert!(!detail.task.global_review_records[0].passed);
     assert!(detail.task.global_review_records.last().unwrap().passed);
     assert!(!detail.task.global_review_records[0].issues.is_empty());
+
+    // 首次任务落在 dev-1.0，完成后迭代应被归档为 completed 且有耗时。
+    assert_eq!(detail.iterations.len(), 1, "first run creates dev-1.0");
+    let first_iteration = &detail.iterations[0];
+    assert_eq!(first_iteration.version, "dev-1.0");
+    assert_eq!(first_iteration.status, "completed");
+    assert!(!first_iteration.start_time.is_empty());
+    assert!(!first_iteration.end_time.is_empty());
+    assert_eq!(first_iteration.subtask_total, 2);
+    assert_eq!(first_iteration.subtask_completed, 2);
+    assert!(
+        first_iteration.token_total > 0,
+        "LLM token usage should be accumulated into the iteration (got {})",
+        first_iteration.token_total
+    );
+    assert!(
+        detail
+            .subtasks
+            .iter()
+            .all(|s| s.iteration_id == first_iteration.id),
+        "all subtasks belong to dev-1.0"
+    );
 
     // 第一轮代码评审被 mock 驳回 -> 第 2 轮通过；之后全局返工又把轮次重置为 1。
     let first = detail.subtasks.iter().find(|s| s.sort_index == 1).unwrap();
@@ -329,8 +372,15 @@ fn full_serial_orchestration_flow() {
         detail
             .execution_events
             .iter()
-            .any(|e| e.kind == "dsh_stdout"),
-        "dsh stdout should be streamed into execution events"
+            .any(|e| e.kind == "agent_message:coder" || e.kind == "tool_call"),
+        "structured coder dialogue/tool events should be streamed"
+    );
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.kind == "agent_message:reviewer"),
+        "reviewer dialogue should be recorded"
     );
 
     // 摘要落盘 & 设计文档 & DB 归档
@@ -343,11 +393,89 @@ fn full_serial_orchestration_flow() {
         assert!(sub.summary_content.contains("# 模块名称"));
         assert!(!sub.summary_file_path.is_empty());
         assert!(Path::new(&sub.summary_file_path).exists());
+        assert!(
+            sub.summary_file_path.contains("tasks"),
+            "summary snapshot should live under external task storage"
+        );
         assert!(!sub.iteration_records.is_empty());
     }
     // 工作目录中确实生成了代码文件，说明 mock dsh 被真实调用过。
     assert!(work_dir.join("src").is_dir());
-    assert!(work_dir.join("summaries").is_dir());
+    // 摘要最终快照已移到项目外，项目目录不再残留 summaries。
+    assert!(!work_dir.join("summaries").is_dir());
+
+    drop(detail);
+    drop(conn);
+
+    // 任务完成后追加一个简单需求：评审应只创建一个子任务，不重新拆解已有模块。
+    let conn = db::open(&db_path).unwrap();
+    let mut task = db::get_task(&conn, task_id).unwrap().unwrap();
+    task.followup_requirement = "给日历页增加导出当日计划为 Markdown 的按钮".into();
+    task.followup_mode = "auto".into();
+    task.task_phase = "requirement_intake".into();
+    task.status = "planning".into();
+    db::save_task(&conn, &task).unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id)
+        .expect("follow-up requirement should complete");
+
+    let conn = db::open(&db_path).unwrap();
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "completed");
+    assert_eq!(
+        detail.task.global_review_cycle, 2,
+        "follow-up starts a new review cycle"
+    );
+    assert_eq!(
+        detail.subtasks.len(),
+        3,
+        "simple follow-up must add exactly one module"
+    );
+    assert!(
+        detail.task.top_requirement.contains("追加需求"),
+        "top requirement should keep follow-up history"
+    );
+    assert!(detail.task.followup_requirement.is_empty());
+
+    // 追加需求默认升小版本：dev-1.1，且新模块只归属该迭代。
+    assert_eq!(detail.iterations.len(), 2, "follow-up creates dev-1.1");
+    assert_eq!(detail.iterations[0].version, "dev-1.0");
+    assert_eq!(detail.iterations[1].version, "dev-1.1");
+    assert_eq!(detail.iterations[1].status, "completed");
+    assert_eq!(detail.iterations[1].subtask_total, 1);
+    assert_eq!(detail.iterations[1].subtask_completed, 1);
+    let new_module = detail
+        .subtasks
+        .iter()
+        .find(|s| s.sort_index == 3)
+        .unwrap();
+    assert_eq!(new_module.iteration_id, detail.iterations[1].id);
+    assert!(
+        detail.iterations.iter().all(|i| i.token_total > 0),
+        "both iterations should track their own token usage"
+    );
+    let followup = detail
+        .subtasks
+        .iter()
+        .find(|s| s.sort_index == 3)
+        .expect("new follow-up module");
+    assert_eq!(followup.subtask_name, "计划导出模块");
+    assert_eq!(followup.status, "completed");
+    assert_eq!(followup.current_round, 1);
+    assert!(!followup.summary_content.is_empty());
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.kind == "requirement_accepted"),
+        "follow-up intake should be recorded"
+    );
+    assert_eq!(
+        detail.task.global_review_records.last().unwrap().cycle,
+        2,
+        "new global review record should belong to cycle 2"
+    );
 }
 
 /// 人工审核模式：方案审批 + 逐模块设计审批 + 人工消息注入。
@@ -408,10 +536,15 @@ fn manual_review_plan_and_design_gates() {
             global_accept_criteria: "接口统一".into(),
             reviewer_agent_id: reviewer.id,
             coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
             module_max_round: 3,
             global_max_round: 3,
             work_dir: work_dir.to_string_lossy().to_string(),
             manual_review_enabled: true,
+            execution_mode: "immediate".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
         },
     )
     .unwrap();
@@ -481,4 +614,294 @@ fn manual_review_plan_and_design_gates() {
         drop(conn);
     }
     panic!("manual review flow did not complete in time");
+}
+
+/// 定时窗口外启动：在派发新模块前自动暂停为 waiting_window。
+#[test]
+fn scheduled_task_pauses_outside_window() {
+    use chrono::{Duration, Local};
+
+    let root = temp_dir("schedule");
+    let app_data = root.join("app-data");
+    let work_dir = root.join("project");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = db::init(&app_data).unwrap();
+    let conn = db::open(&db_path).unwrap();
+
+    let start = (Local::now() + Duration::hours(2))
+        .format("%H:%M")
+        .to_string();
+    let end = (Local::now() + Duration::hours(3))
+        .format("%H:%M")
+        .to_string();
+    conn.execute(
+        "INSERT INTO agent_config(id,name,role_type,provider,model_name,base_url,api_key,system_prompt,temperature,create_time)
+         VALUES (1,'R','reviewer','openai-compatible','mock','http://127.0.0.1:1/v1','k','',0.0,'2026-01-01 00:00:00'),
+                (2,'C','coder','openai-compatible','mock','http://127.0.0.1:1/v1','k','',0.0,'2026-01-01 00:00:00')",
+        [],
+    )
+    .unwrap();
+    let task_id = db::create_task(
+        &conn,
+        &NewTaskInput {
+            task_name: "定时窗口外".into(),
+            top_requirement: "需求".into(),
+            global_accept_criteria: "验收".into(),
+            reviewer_agent_id: 1,
+            coder_agent_ids: vec![2],
+            workflow_agent_ids: vec![],
+            module_max_round: 3,
+            global_max_round: 2,
+            work_dir: work_dir.to_string_lossy().to_string(),
+            manual_review_enabled: false,
+            execution_mode: "scheduled".into(),
+            schedule_start: start,
+            schedule_end: end,
+            schedule_enabled: true,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id).unwrap();
+    let conn = db::open(&db_path).unwrap();
+    let task = db::get_task(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "paused");
+    assert_eq!(task.pause_reason, "waiting_window");
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subtask WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "outside window must not dispatch a new module");
+}
+
+/// 临时问答必须直接回复，不创建子任务，也不改变任务状态。
+#[test]
+fn chat_channel_does_not_trigger_pipeline() {
+    let root = temp_dir("chat");
+    let app_data = root.join("app-data");
+    let work_dir = root.join("project");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = db::init(&app_data).unwrap();
+    let port = start_mock_llm();
+    let conn = db::open(&db_path).unwrap();
+
+    let reviewer = db::save_agent(
+        &conn,
+        &AgentInput {
+            id: None,
+            name: "Mock Reviewer".into(),
+            role_type: "reviewer".into(),
+            provider: "openai-compatible".into(),
+            model_name: "mock-model".into(),
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            api_key: "test-key".into(),
+            system_prompt: "你是技术总监".into(),
+            temperature: 0.0,
+        },
+    )
+    .unwrap();
+    let coder = db::save_agent(
+        &conn,
+        &AgentInput {
+            id: None,
+            name: "Mock Coder".into(),
+            role_type: "coder".into(),
+            provider: "openai-compatible".into(),
+            model_name: "mock-model".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "test-key".into(),
+            system_prompt: "你是编码者".into(),
+            temperature: 0.2,
+        },
+    )
+    .unwrap();
+    let mut settings = AppSettings::default();
+    settings.llm_timeout_sec = "15".into();
+    db::save_settings(&conn, &settings).unwrap();
+
+    let task_id = db::create_task(
+        &conn,
+        &NewTaskInput {
+            task_name: "问答隔离测试".into(),
+            top_requirement: "只做问答，不开发".into(),
+            global_accept_criteria: "不创建子任务".into(),
+            reviewer_agent_id: reviewer.id,
+            coder_agent_ids: vec![coder.id],
+            workflow_agent_ids: vec![],
+            module_max_round: 3,
+            global_max_round: 2,
+            work_dir: work_dir.to_string_lossy().to_string(),
+            manual_review_enabled: false,
+            execution_mode: "later".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
+        },
+    )
+    .unwrap();
+
+    let reply =
+        orchestrator::chat_with_connection(&conn, task_id, "这个模块为什么选 JWT？", &settings)
+            .unwrap();
+    assert_eq!(reply.role, "assistant");
+    assert!(reply.content.contains("临时问答回复"));
+
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "pending");
+    assert!(
+        detail.subtasks.is_empty(),
+        "chat must not dispatch subtasks"
+    );
+    assert_eq!(detail.chat_messages.len(), 2);
+    assert_eq!(detail.chat_messages[0].role, "user");
+    assert_eq!(detail.chat_messages[1].role, "assistant");
+}
+
+/// V2.5：可扩展角色 + 线性工作流。
+/// 工作流为「产品经理（需求梳理）→ 评审者（方案/评审）→ 编码者（编码）」，
+/// 验证阶段按能力标签解析到正确的 Agent，并把 Agent/角色写入事件。
+#[test]
+fn three_role_workflow_routes_by_capability() {
+    let root = temp_dir("roles");
+    let app_data = root.join("app-data");
+    let work_dir = root.join("project");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = db::init(&app_data).unwrap();
+    let mock_dsh = write_mock_dsh(&root);
+    let port = start_mock_llm();
+
+    let conn = db::open(&db_path).unwrap();
+    let save = |name: &str, role: &str| {
+        db::save_agent(
+            &conn,
+            &AgentInput {
+                id: None,
+                name: name.into(),
+                role_type: role.into(),
+                provider: "openai-compatible".into(),
+                model_name: "mock-model".into(),
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "test-key".into(),
+                system_prompt: String::new(),
+                temperature: 0.0,
+            },
+        )
+        .unwrap()
+    };
+    // 自定义角色：只做需求梳理。
+    let pm_role = db::save_role(
+        &conn,
+        &RoleInput {
+            id: None,
+            key: "pm_e2e".into(),
+            name: "产品经理E2E".into(),
+            description: "需求梳理".into(),
+            capabilities: vec!["requirement".into()],
+            color: "#ffc857".into(),
+        },
+    )
+    .unwrap();
+    let pm = save("PM-E2E", &pm_role.key);
+    let reviewer = save("Reviewer-E2E", "reviewer");
+    let coder = save("Coder-E2E", "coder");
+
+    let mut settings = AppSettings::default();
+    settings.dsh_bin = mock_dsh.to_string_lossy().to_string();
+    settings.dsh_timeout_sec = "60".into();
+    settings.llm_timeout_sec = "15".into();
+    db::save_settings(&conn, &settings).unwrap();
+
+    let task_id = db::create_task(
+        &conn,
+        &NewTaskInput {
+            task_name: "三角色工作流".into(),
+            top_requirement: "开发一个带基础数据和业务接口的演示系统".into(),
+            global_accept_criteria: "接口统一、可运行、摘要齐全".into(),
+            reviewer_agent_id: 0,
+            coder_agent_ids: vec![],
+            workflow_agent_ids: vec![pm.id, reviewer.id, coder.id],
+            module_max_round: 3,
+            global_max_round: 3,
+            work_dir: work_dir.to_string_lossy().to_string(),
+            manual_review_enabled: false,
+            execution_mode: "immediate".into(),
+            schedule_start: "01:00".into(),
+            schedule_end: "06:00".into(),
+            schedule_enabled: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id).unwrap();
+
+    let conn = db::open(&db_path).unwrap();
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "completed");
+    assert_eq!(detail.task.workflow_agent_ids, vec![pm.id, reviewer.id, coder.id]);
+    assert_eq!(detail.workflow.len(), 3);
+    assert_eq!(detail.workflow[0].role_name, "产品经理E2E");
+    assert!(detail.roles.iter().any(|r| r.key == "pm_e2e"));
+
+    // 方案规划必须由具备 plan 能力的评审者执行，而不是第一个 Agent（产品经理）。
+    let planner_requests: Vec<&agent_crew_lib::models::TaskEvent> = detail
+        .execution_events
+        .iter()
+        .filter(|e| e.kind == "llm_request:planner")
+        .collect();
+    assert!(!planner_requests.is_empty(), "planner call expected");
+    assert!(
+        planner_requests
+            .iter()
+            .all(|e| e.content.contains("Reviewer-E2E")),
+        "planner stage should use the plan-capable agent"
+    );
+    // 代码评审事件归属评审者，编码事件归属 Coder。
+    let review_events: Vec<&agent_crew_lib::models::TaskEvent> = detail
+        .execution_events
+        .iter()
+        .filter(|e| e.kind == "agent_message:reviewer")
+        .collect();
+    assert!(
+        review_events
+            .iter()
+            .any(|e| e.agent_name == "Reviewer-E2E" && e.role_name == "评审者")
+    );
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.agent_name == "Coder-E2E" && !e.role_name.is_empty())
+    );
+
+    // 追加需求：需求梳理应由产品经理执行（具备 requirement 能力）。
+    let mut task = db::get_task(&conn, task_id).unwrap().unwrap();
+    task.followup_requirement = "给日历页增加导出当日计划为 Markdown 的按钮".into();
+    task.followup_mode = "auto".into();
+    task.task_phase = "requirement_intake".into();
+    task.status = "planning".into();
+    db::save_task(&conn, &task).unwrap();
+    drop(conn);
+
+    orchestrator::run_task_headless(&db_path, &app_data, task_id)
+        .expect("follow-up should finish with 3-role workflow");
+    let conn = db::open(&db_path).unwrap();
+    let detail = db::get_task_detail(&conn, task_id).unwrap();
+    assert_eq!(detail.task.status, "completed");
+    assert!(
+        detail
+            .execution_events
+            .iter()
+            .any(|e| e.agent_name == "PM-E2E" && e.role_name == "产品经理E2E"),
+        "requirement intake should be handled by the product manager"
+    );
+    let iteration = detail.iterations.last().unwrap();
+    assert!(
+        !iteration.analysis.trim().is_empty(),
+        "product manager intake should persist analysis"
+    );
 }
