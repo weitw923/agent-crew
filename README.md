@@ -20,16 +20,10 @@ AgentCrew 把这些环节串成一条**固定顺序的流水线**，全程在你
 
 ## 现成安装包
 
-仓库里已经放好打包产物，clone 后直接安装即可：
-
-| 文件 | 版本 | 平台 | 说明 |
-| --- | --- | --- | --- |
-| [`releases/AgentCrew_2.5.0_aarch64.dmg`](releases/AgentCrew_2.5.0_aarch64.dmg) | v2.5.0 | macOS Apple Silicon（arm64） | 打开 DMG，把 `AgentCrew` 拖进 `/Applications` |
+[软件安装包下载链接](https://gitee.com/weitw/agent-crew/releases/)
 
 - DMG 未做 Apple 签名 / 公证，首次打开如果提示「无法验证开发者」，在 **系统设置 → 隐私与安全性** 里点「仍要打开」，或终端执行 `xattr -dr com.apple.quarantine /Applications/AgentCrew.app`。
 - 目前没有 Windows / Linux 的现成包。应用本身基于 Tauri，在对应平台按下面的源码步骤执行 `npm run tauri build` 即可打包出 `.msi` / `.exe` / `.deb` / `.AppImage`，是否顺畅运行尚未在真实机器验证。
-- SHA256：`497c41c190d8b78f437a912b1cdd9554d5cf1c5c1f78554ac9a777a2fd4ee686`
-- 更新版本时，把 `src-tauri/target/release/bundle/dmg/` 下的新 `.dmg` 复制到 `releases/` 并更新此表即可。
 
 ## 依赖
 
