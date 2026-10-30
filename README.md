@@ -1,5 +1,6 @@
 # AgentCrew
 
+
 AgentCrew 是一个**本地优先**的多 Agent 代码开发编排桌面应用（Tauri 2 + Vue 3 + Rust + SQLite），当前版本 **v2.5.0**。
 
 ## 背景
